@@ -127,5 +127,20 @@ probe-rs run --chip CH32V208WBU6 build/ch32v208_nimble.elf
 - **auto-ack 未启用**：v1 收发走手动模式字序列（BB[0x2C] arm 位留待 S3 后开启自动应答）。
 - **RNG 非安全熵源**：控制器随机数来自硬件 LFSR 类源，可用于地址生成，**不可**作为配对/加密密钥熵源（SM v1 未启用，见下）。
 - **privacy / 2M PHY / coded PHY 关闭**：仅 legacy 1M 广播与连接；地址用 public（控制器不回 BD_ADDR 时退化为静态随机）。
-- **SM/配对 v1 不配**：GATT 特征全部无加密要求；`ble_hs_cfg.store_status_cb` 用 ignore-error 策略。
+- **SM/配对 v1 不配**：GATT 特征全部无加密要求；`ble_hs_cfg.store_status_cb` 用 NimBLE 标准 `ble_store_util_status_rr` 策略（绑定/白名单写入空操作，状态事件按 rr 策略回复）。
 - host `util`（ble_hs_util_ensure_addr）与 NimBLE 自带 `services/*` 不在编译列表内——应用自带 GATT 服务注册，地址处理见 `app/app_ble.c`。
+
+## 集成审查记录（v1 冻结）
+
+四个子任务（SDK/FreeRTOS/RTT 平台、NimBLE NPL 移植、WCH RF 寄存器驱动、应用层）合入后，主控逐文件对照逆向文档复核，最终全量链接通过：`ch32v208_nimble` FLASH 126.9 KB / 448 KB（27.7%），RAM 53.8 KB / 64 KB（82.1%，含 20K FreeRTOS 堆 + 16K newlib 堆 + 2K 栈，bss 末尾 `0x20008a10`，heap→`0x2000ca10`，栈顶 `0x20010000`，余 11.7K）；`boot` 引导镜像同步回归通过。合入时的主要修正：
+
+| 修正 | 位置 | 说明 |
+|---|---|---|
+| 白名单 AdvA/TargetA 偏移与 TxAdd 掩码 | `ble_hw_wch.c` | AdvA 在 `pdu+2`（PDU 头 2 字节后），非 `pdu+6`；TargetA `pdu+8`；TxAdd 需 `(pdu[0]>>6)&1` |
+| CRC 判定默认信任硬件 | `ble_phy_wch.c` | RE 文档中 CRC 经独立指针（DAT_20000334）存放、未必在缓冲区尾；软件 CRC24 校验保留为 `s_crc_sw_verify` 调试开关，默认 0 |
+| `ble_phy_mode_set` 改无条件编译 | `ble_phy_wch.c` | 上游 ble_ll_adv/conn/scan 调用点不受特性宏保护；v1 内部钳位 1M |
+| mbedtls 软件 AES-128+CMAC shim | `port/crypto_mbedtls_shim.c` | `ble_ll_crypto.c`/`ble_sm_alg.c` 无条件包含 `<mbedtls/cmac.h>`；shim 过 FIPS-197 C.1 与 pycryptodome CMAC 参考向量（后续可换硬件 AES） |
+| NPL ISR 路由 | `config/nimble/nimble_npl_os.h` + `port/nimble_port_wch.c` | 上游 `in_isr()` 读 ARM SCB 在 RISC-V 恒假；eventq/sem/callout_reset 五入口经 `npl_wch_*` 以 `mcause` bit31 分流到 `*FromISR()` |
+| 链接组 + heap 封顶 | `CMakeLists.txt`、`ld/Link.ld` | wch_ble↔nimble_core 互引需 `-Wl,--start-group`；newlib 堆固定 16K（NimBLE `os_malloc`→malloc→`_sbrk` 消耗），不再吞掉全部 RAM 余量 |
+
+构建产物：`build/ch32v208_nimble.{elf,hex,bin,map}`。上板入口见上文 S0–S5 计划与 `scripts/run.sh`。

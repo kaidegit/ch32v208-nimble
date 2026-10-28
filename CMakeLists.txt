@@ -136,6 +136,9 @@ add_library(wch_ble STATIC
     port/hal_timer_wch.c
     port/nimble_port_wch.c
     port/console_rtt.c
+    # Software AES-128 + CMAC behind the config/mbedtls/ headers; NimBLE's
+    # ble_ll_crypto.c / ble_sm_alg.c include <mbedtls/cmac.h> unconditionally.
+    port/crypto_mbedtls_shim.c
 )
 target_include_directories(wch_ble PUBLIC
     drivers/wch_ble
@@ -157,8 +160,12 @@ add_executable(ch32v208_nimble
     app/system_ch32v20x.c
     ${SDK_DIR}/Startup/startup_ch32v20x_D8W.S
 )
+# wch_ble and nimble_core reference each other (LL calls ble_phy_*, the PHY
+# port calls ble_ll_*), so the archives must be rescanned as a group.
 target_link_libraries(ch32v208_nimble
-    PRIVATE wch_ble nimble_core sdk_periph freertos_kernel segger_rtt)
+    PRIVATE -Wl,--start-group
+            wch_ble nimble_core sdk_periph freertos_kernel segger_rtt
+            -Wl,--end-group)
 target_include_directories(ch32v208_nimble PRIVATE app port)
 target_link_options(ch32v208_nimble PRIVATE
     -T${CMAKE_CURRENT_SOURCE_DIR}/ld/Link.ld

@@ -1,2 +1,827 @@
-/* stub: replaced by implementation agent */
-typedef int _stub_keep_t;
+/*
+ * ble_phy_wch.c - Apache NimBLE controller PHY adapter for WCH CH32V208.
+ *
+ * Implements the full controller/ble_phy.h contract on top of the
+ * register-level CH32V208 BLE modem driver (wch_rf.h/c).  Structure follows
+ * nimble/drivers/native/src/ble_phy.c; behavior follows the reverse
+ * engineered libwchble programming model (WCH_BLE_LIB_RE_FINDINGS.md,
+ * referenced as "RE §x.y").
+ *
+ * Frame format on the WCH LLE (RE §4.6/§4.8):
+ *   TX/RX frame = [PDU header][len][payload] - identical to the lib's
+ *   [pktTxType][txLen][data] "type first" layout (rfConfig bit7 = 1).
+ *
+ * v1 timing model is software scheduled (see ble_phy_tx_set_start_time).
+ * All board-calibratable constants live in struct wch_rf_timing (wch_rf.h).
+ */
+
+#include <stdint.h>
+#include <string.h>
+
+#include "syscfg/syscfg.h"
+#include "os/os.h"
+#include "os/os_cputime.h"
+#include "nimble/ble.h"
+#include "nimble/nimble_opt.h"
+#include "controller/ble_phy.h"
+#include "controller/ble_ll.h"
+
+#include "wch_rf.h"
+
+#ifndef min
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+/* ------------------------------------------------------------------------- */
+/* State                                                                     */
+/* ------------------------------------------------------------------------- */
+
+struct ble_phy_obj
+{
+    uint8_t phy_state;          /* BLE_PHY_STATE_*                        */
+    uint8_t phy_transition;     /* BLE_PHY_TRANSITION_* for the TX in fly */
+    uint8_t phy_rx_started;     /* frame reception has started            */
+    uint8_t phy_encrypted;      /* link encryption armed                  */
+    uint8_t phy_privacy;        /* resolv list enabled flag               */
+    uint8_t phy_chan;           /* current BLE channel 0..39              */
+    uint8_t phy_tx_phy_mode;    /* BLE_PHY_MODE_1M / _2M                  */
+    uint8_t phy_rx_phy_mode;
+    uint8_t phy_dtm;            /* DTM mode flag (demod cfg, RE §4.4)     */
+    uint32_t phy_access_address;
+    uint32_t phy_crcinit;
+    struct ble_mbuf_hdr rxhdr;
+    void *txend_arg;
+    ble_phy_tx_end_func txend_cb;
+};
+
+static struct ble_phy_obj g_ble_phy_data;
+
+/* Plain counters instead of STATS_* to avoid a stats dependency (task spec) */
+struct ble_phy_stats
+{
+    uint32_t phy_isrs;
+    uint32_t tx_good;
+    uint32_t tx_fail;
+    uint32_t tx_late;
+    uint32_t tx_bytes;
+    uint32_t rx_starts;
+    uint32_t rx_aborts;
+    uint32_t rx_valid;
+    uint32_t rx_crc_err;
+    uint32_t rx_late;
+    uint32_t rx_timeouts;
+    uint32_t radio_state_errs;
+    uint32_t no_bufs;
+    uint32_t hw_errs;
+};
+
+static struct ble_phy_stats g_ble_phy_stats;
+
+/* TX frame: [hdr][len][payload]; RX buffer keeps a small guard tail */
+static uint8_t g_ble_phy_tx_buf[BLE_PHY_MAX_PDU_LEN];
+static uint8_t g_ble_phy_rx_buf[BLE_PHY_MAX_PDU_LEN + 4];
+
+/* Software scheduling (v1 timing model) */
+static uint8_t s_tx_sched_valid;
+static uint32_t s_tx_sched_cputime;
+static uint8_t s_tx_sched_rem_us;
+static uint8_t s_rx_sched_valid;
+static uint32_t s_rx_sched_cputime;
+static uint8_t s_rx_sched_rem_us;
+
+/* Link encryption (AES-CCM) cache, RE §12.5 */
+static uint8_t s_enc_key[16];
+static uint8_t s_enc_iv[8];
+static uint64_t s_enc_counter;
+static uint8_t s_enc_dir_bit;
+static uint8_t s_enc_hdr_mask;
+
+/*
+ * CRC verdict policy (reviewer integration note):
+ * The RE findings locate no hardware CRC status bit, and the lib re-verifies
+ * in software against a SEPARATE CRC storage (DAT_20000334, RE §12.0) whose
+ * location this port does not know.  crc24_compute() assumes the LLE appends
+ * the 3 CRC bytes after the payload - unverified on silicon.  Default is to
+ * TRUST the hardware verdict (every frame CRC-OK); flip to 1 on the board to
+ * A/B the assumption (every frame failing => CRC bytes are NOT in the buffer
+ * => find the real status bit before trusting either way).
+ */
+static uint8_t s_crc_sw_verify;
+
+/* ------------------------------------------------------------------------- */
+/* Helpers                                                                   */
+/* ------------------------------------------------------------------------- */
+
+static uint32_t
+load32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/*
+ * Software CRC-24 of a BLE PDU (BLE_PHY_MAX_PDU_LEN bytes worst case).
+ * Poly x^24+x^10+x^9+x^6+x^4+x^3+x+1, reflected constant 0xDA6000, init =
+ * CRCInit.
+ *
+ * RE note: the LLE checks CRC in hardware but RE §4.8 shows the lib still
+ * re-verifies in software (ble_ll_chkcrc) because no CRC-status register was
+ * identified (RE §5.3 status bits carry no CRC flag).  TODO(board): locate
+ * the hardware CRC status bit and drop this software pass.
+ */
+static uint32_t
+crc24_compute(const uint8_t *d, uint16_t len, uint32_t crcinit)
+{
+    uint32_t crc = crcinit & 0xFFFFFFUL;
+    uint16_t i;
+    int b;
+
+    for (i = 0; i < len; i++) {
+        crc ^= d[i];
+        for (b = 0; b < 8; b++) {
+            if (crc & 1UL) {
+                crc = (crc >> 1) ^ 0xDA6000UL;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc & 0xFFFFFFUL;
+}
+
+/* Generous hardware TX busy-window: preamble+AA+CRC ~ 80 us + 8 us/byte. */
+static uint32_t
+tx_window_half_us(uint8_t pyld_len)
+{
+    uint32_t airtime_us = 80UL + 8UL * ((uint32_t)pyld_len + 2UL);
+
+    return 2UL * airtime_us + 100UL;
+}
+
+/* Default RX window (0.5 us units) when the LL gives no wfr value. */
+static uint32_t
+rx_window_default_half_us(void)
+{
+    return g_wch_rf_timing.wfr_half_us_1m + g_wch_rf_timing.rx_window_widen_half_us;
+}
+
+/*
+ * v1 software scheduling: spin until (sched_start - tx_guard) is reached.
+ * Bounded: returns -1 once (sched_start + tx_late_guard) has passed.
+ * TODO(board): replace with a hardware compare/timer driven start
+ * (RE §12.10 lists precise scheduling as an open item).
+ */
+static int
+wait_until_start(uint32_t sched_cputime, uint8_t rem_us)
+{
+    uint32_t guard;
+    uint32_t late;
+    uint32_t now;
+
+    if (!s_tx_sched_valid && !s_rx_sched_valid) {
+        return 0;
+    }
+    (void)rem_us;   /* cputime runs at 1 MHz; rem_us sub-tick is ignored */
+
+    guard = sched_cputime - g_wch_rf_timing.tx_guard_us;
+    late = sched_cputime + g_wch_rf_timing.tx_late_guard_us;
+
+    for (;;) {
+        now = os_cputime_get32();
+        if ((int32_t)(now - guard) >= 0) {
+            if ((int32_t)(now - late) > 0) {
+                return -1;
+            }
+            return 0;
+        }
+    }
+}
+
+/*
+ * Program the AES-CCM context for the next packet, RE §12.5
+ * AES_DevPktEnc/Dec:
+ *   LLE[0x50] |= 0x80 (CCM armed)
+ *   AES[0x00] = dir<<5 | 0x80
+ *   AES[0x10/0x14] = IV(8B), AES[0x08/0x0C] = counter, AES[0x28..] = key
+ *   AES[0x00] |= 0x40 (commit)
+ * LLE[0x50] mode-word bit5 (0x20) is ORed in by wch_rf at every TX/RX arm
+ * (wch_rf_encrypt_get()).
+ *
+ * v1: sequence transcribed from RE but NOT yet exercised on hardware.
+ * The header mask (Core 5.3 Vol 6 2.2) has no RE-identified register and is
+ * cached only - encrypted control PDUs may behave differently (board test).
+ */
+static void
+phy_encrypt_ccm_program(void)
+{
+    int i;
+
+    WCH_LLE_MODE |= WCH_LLE_MODE_CCM_ARMED;             /* RE §12.5 */
+    WCH_AES_CTRL = (s_enc_dir_bit ? WCH_AES_CTRL_DIR_DECRYPT : 0) |
+                   WCH_AES_CTRL_CCM;
+    WCH_AES_IV_LO = load32_le(s_enc_iv);
+    WCH_AES_IV_HI = load32_le(s_enc_iv + 4);
+    WCH_AES_CNT_LO = (uint32_t)s_enc_counter;
+    /* 39-bit packet counter: RE §12.5 LL_ConnectTx/RxPktnumIncrease. High
+     * word usage beyond bit 6 not confirmed; mask conservatively. */
+    WCH_AES_CNT_HI = (uint32_t)(s_enc_counter >> 32) & 0x7FUL;
+    for (i = 0; i < 4; i++) {
+        WCH_AES_KEY(i) = load32_le(s_enc_key + i * 4);
+    }
+    WCH_AES_CTRL |= WCH_AES_CTRL_CCM_COMMIT;            /* RE §12.5 */
+
+    wch_rf_encrypt_set(true);
+}
+
+/* ------------------------------------------------------------------------- */
+/* ISR-context handlers (run from wch_rf callback == LLE/BB ISR context)     */
+/* ------------------------------------------------------------------------- */
+
+static void
+phy_tx_done_isr(uint32_t ts)
+{
+    uint8_t transition = g_ble_phy_data.phy_transition;
+
+    (void)ts;
+
+    if (g_ble_phy_data.phy_state != BLE_PHY_STATE_TX) {
+        return;
+    }
+
+    if (transition == BLE_PHY_TRANSITION_TX_RX) {
+        /*
+         * wch_rf already armed the T_IFS RX (RE §4.8 rf_tx_auto_txProcess
+         * relocated into the TX-done ISR): synth retuned, RX demod group
+         * applied, ACK window in LLE[0x64], BB[0x2C] RX-arm set.
+         * TODO(board): confirm the BB[0x2C]-only (lib-faithful) arm path
+         * starts the RX window; fallback is an explicit LLE[0x00]=1 here.
+         */
+        g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
+        g_ble_phy_data.phy_rx_started = 0;
+    } else {
+        g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
+    }
+
+    if (g_ble_phy_data.txend_cb) {
+        g_ble_phy_data.txend_cb(g_ble_phy_data.txend_arg);
+    }
+}
+
+static void
+phy_rx_done_isr(uint32_t ts)
+{
+    uint8_t *rxbuf = g_ble_phy_rx_buf;
+    struct ble_mbuf_hdr *ble_hdr = &g_ble_phy_data.rxhdr;
+    uint16_t len;
+    int rc;
+
+    if (g_ble_phy_data.phy_state != BLE_PHY_STATE_RX) {
+        return;
+    }
+
+    g_ble_phy_data.phy_rx_started = 1;
+    ++g_ble_phy_stats.rx_starts;
+
+    len = rxbuf[1];
+    if (len > (BLE_PHY_MAX_PDU_LEN - BLE_LL_PDU_HDR_LEN)) {
+        len = BLE_PHY_MAX_PDU_LEN - BLE_LL_PDU_HDR_LEN;
+    }
+
+    /* Provisional header (CRC verdict added below).  RE §4.9 RSSI = BB[0xC0]
+     * bits[22:15]; anchor timestamp = BB clock-capture (RE §5.2) taken at
+     * access-address match, falling back to the completion timestamp. */
+    ble_hdr->rxinfo.flags = 0;
+    ble_hdr->rxinfo.channel = g_ble_phy_data.phy_chan;
+    ble_hdr->rxinfo.handle = 0;
+    ble_hdr->rxinfo.rssi = wch_rf_rssi();
+    ble_hdr->rxinfo.phy = BLE_PHY_1M;
+    ble_hdr->rxinfo.phy_mode = BLE_PHY_MODE_1M;
+    ble_hdr->beg_cputime = wch_rf_last_anchor() ? wch_rf_last_anchor() : ts;
+    ble_hdr->rem_usecs = 0;
+
+    /*
+     * ble_ll_rx_start(): v1 calls it at RX completion - the WCH modem gives
+     * no independent address-match event to the CPU before the whole frame
+     * is in (the BB bit6 clock-capture event is the closest analogue and is
+     * used for the timestamp).  The rx_isr_start hooks mostly cancel the wfr
+     * timer / record state; calling them late is the tolerated deviation
+     * (see ble_ll.c wfr logic: rx_started() short-circuits wfr handling).
+     */
+    rc = ble_ll_rx_start(rxbuf, g_ble_phy_data.phy_chan, ble_hdr);
+    if (rc < 0) {
+        ble_phy_disable();
+        ++g_ble_phy_stats.rx_aborts;
+        return;
+    }
+
+    /* CRC verdict - see s_crc_sw_verify note above. */
+    if (!s_crc_sw_verify ||
+        (crc24_compute(rxbuf, (uint16_t)(len + BLE_LL_PDU_HDR_LEN),
+                       g_ble_phy_data.phy_crcinit) == 0)) {
+        ble_hdr->rxinfo.flags |= BLE_MBUF_HDR_F_CRC_OK;
+        ++g_ble_phy_stats.rx_valid;
+    } else {
+        ++g_ble_phy_stats.rx_crc_err;
+    }
+
+    rc = ble_ll_rx_end(rxbuf, ble_hdr);
+    if (rc < 0) {
+        ble_phy_disable();
+    }
+}
+
+static void
+phy_rx_timeout_isr(void)
+{
+    if (g_ble_phy_data.phy_state != BLE_PHY_STATE_RX) {
+        return;
+    }
+
+    if (!g_ble_phy_data.phy_rx_started) {
+        /* Nothing received: wfr expiry.  Same pattern as nrf5x
+         * ble_phy_isr DISABLED-without-start -> ble_ll_wfr_timer_exp. */
+        ble_phy_disable();
+        ++g_ble_phy_stats.rx_timeouts;
+        ble_ll_wfr_timer_exp(NULL);
+    } else {
+        /* Frame started but engine reports timeout - treat as HW error. */
+        ble_phy_disable();
+        ++g_ble_phy_stats.hw_errs;
+        ble_ll_hw_error();
+    }
+}
+
+static void
+wch_phy_rf_event(enum wch_rf_event evt, uint32_t payload)
+{
+    ++g_ble_phy_stats.phy_isrs;
+
+    switch (evt) {
+    case WCH_RF_EVT_TX_DONE:
+        phy_tx_done_isr(payload);
+        break;
+    case WCH_RF_EVT_RX_DONE:
+        phy_rx_done_isr(payload);
+        break;
+    case WCH_RF_EVT_RX_TIMEOUT:
+        phy_rx_timeout_isr();
+        break;
+    default:
+        ++g_ble_phy_stats.hw_errs;
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* ble_phy.h implementation                                                  */
+/* ------------------------------------------------------------------------- */
+
+int
+ble_phy_init(void)
+{
+    memset(&g_ble_phy_data, 0, sizeof(g_ble_phy_data));
+    memset(&g_ble_phy_stats, 0, sizeof(g_ble_phy_stats));
+
+    g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
+    g_ble_phy_data.phy_chan = BLE_PHY_NUM_CHANS;    /* invalid: forces setchan */
+    g_ble_phy_data.phy_tx_phy_mode = BLE_PHY_MODE_1M;
+    g_ble_phy_data.phy_rx_phy_mode = BLE_PHY_MODE_1M;
+
+    s_tx_sched_valid = 0;
+    s_rx_sched_valid = 0;
+
+    /* Driver events arrive through the wch_rf ISR callback. */
+    wch_rf_set_callback(wch_phy_rf_event);
+
+    return 0;
+}
+
+int
+ble_phy_setchan(uint8_t chan, uint32_t access_addr, uint32_t crcinit)
+{
+    if (chan >= BLE_PHY_NUM_CHANS) {
+        return BLE_PHY_ERR_INV_PARAM;
+    }
+
+    g_ble_phy_data.phy_access_address = access_addr;
+    g_ble_phy_data.phy_crcinit = crcinit & 0xFFFFFFUL;
+    g_ble_phy_data.phy_chan = chan;
+
+    /* Program the synthesizer now (RE §4.2); re-programmed again inside the
+     * TX/RX arm sequences exactly like RF_Tx/RF_Rx do. */
+    wch_rf_set_channel(chan);
+    wch_rf_aa_crc_set(access_addr, crcinit);
+
+    return 0;
+}
+
+uint8_t
+ble_phy_chan_get(void)
+{
+    return g_ble_phy_data.phy_chan;
+}
+
+#if MYNEWT_VAL(BLE_PHY_VARIABLE_TIFS)
+void
+ble_phy_tifs_set(uint16_t tifs)
+{
+    /* v1: T_IFS is fixed by the LLE turnaround table (RE §5.3); stored for
+     * future use. TODO(board). */
+    (void)tifs;
+}
+#endif
+
+void
+ble_phy_tifs_txtx_set(uint16_t usecs, uint8_t anchor)
+{
+    /* TX-TX transitions not used by this port (no ISO / CTE). */
+    (void)usecs;
+    (void)anchor;
+}
+
+int
+ble_phy_tx_set_start_time(uint32_t cputime, uint8_t rem_usecs)
+{
+    s_tx_sched_valid = 1;
+    s_tx_sched_cputime = cputime;
+    s_tx_sched_rem_us = rem_usecs;
+
+    /* Late check happens in ble_phy_tx() (returns BLE_PHY_ERR_TX_LATE). */
+    return 0;
+}
+
+int
+ble_phy_rx_set_start_time(uint32_t cputime, uint8_t rem_usecs)
+{
+    s_rx_sched_valid = 1;
+    s_rx_sched_cputime = cputime;
+    s_rx_sched_rem_us = rem_usecs;
+
+    if ((int32_t)(os_cputime_get32() -
+                  (cputime + g_wch_rf_timing.tx_late_guard_us)) > 0) {
+        ++g_ble_phy_stats.rx_late;
+        /* Like nrf5x: still attempt reception. */
+    }
+    return 0;
+}
+
+void
+ble_phy_set_txend_cb(ble_phy_tx_end_func txend_cb, void *arg)
+{
+    g_ble_phy_data.txend_cb = txend_cb;
+    g_ble_phy_data.txend_arg = arg;
+}
+
+int
+ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
+{
+    uint8_t hdr_byte;
+    uint8_t pyld_len;
+    int rc;
+
+    if (ble_phy_state_get() != BLE_PHY_STATE_IDLE) {
+        ble_phy_disable();
+        ++g_ble_phy_stats.radio_state_errs;
+        return BLE_PHY_ERR_RADIO_STATE;
+    }
+
+    if (pducb == NULL) {
+        return BLE_PHY_ERR_INV_PARAM;
+    }
+
+    if (g_ble_phy_data.phy_encrypted) {
+        phy_encrypt_ccm_program();
+    }
+
+    /* Build the frame: [hdr][len][payload] (pducb writes the payload and
+     * returns its length, RE §4.6 [pktTxType][txLen][data]). */
+    pyld_len = pducb(g_ble_phy_tx_buf + BLE_LL_PDU_HDR_LEN, pducb_arg,
+                     &hdr_byte);
+    g_ble_phy_tx_buf[0] = hdr_byte;
+    g_ble_phy_tx_buf[1] = pyld_len;
+
+    g_ble_phy_data.phy_transition = end_trans;
+    wch_rf_auto_arm_rx(end_trans == BLE_PHY_TRANSITION_TX_RX);
+
+    /* v1 software scheduling: busy-wait to (start - guard). */
+    if (s_tx_sched_valid &&
+        wait_until_start(s_tx_sched_cputime, s_tx_sched_rem_us) != 0) {
+        s_tx_sched_valid = 0;
+        ++g_ble_phy_stats.tx_late;
+        g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
+        wch_rf_auto_arm_rx(false);
+        return BLE_PHY_ERR_TX_LATE;
+    }
+    s_tx_sched_valid = 0;
+
+    g_ble_phy_data.phy_state = BLE_PHY_STATE_TX;
+
+    rc = wch_rf_tx_basic(g_ble_phy_tx_buf,
+                         (uint16_t)(pyld_len + BLE_LL_PDU_HDR_LEN),
+                         tx_window_half_us(pyld_len));
+    if (rc != 0) {
+        ++g_ble_phy_stats.tx_fail;
+        g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
+        wch_rf_auto_arm_rx(false);
+        return BLE_PHY_ERR_RADIO_STATE;
+    }
+
+    ++g_ble_phy_stats.tx_good;
+    g_ble_phy_stats.tx_bytes += (uint32_t)pyld_len + BLE_LL_PDU_HDR_LEN;
+    return BLE_ERR_SUCCESS;
+}
+
+void
+ble_phy_rxpdu_copy(uint8_t *dptr, struct os_mbuf *rxpdu)
+{
+    struct os_mbuf *m;
+    struct ble_mbuf_hdr *ble_hdr;
+    uint16_t rem_bytes;
+    uint16_t space;
+
+    rem_bytes = OS_MBUF_PKTHDR(rxpdu)->omp_len;
+    m = rxpdu;
+
+    while ((m != NULL) && (rem_bytes > 0)) {
+        space = m->om_omp->omp_databuf_len - m->om_pkthdr_len;
+        if (m == rxpdu) {
+            space -= 4;     /* native driver reserves 4 bytes in the head */
+        }
+        if (space > rem_bytes) {
+            space = rem_bytes;
+        }
+        memcpy(m->om_data + m->om_len, dptr, space);
+        m->om_len += space;
+        dptr += space;
+        rem_bytes -= space;
+        m = SLIST_NEXT(m, om_next);
+    }
+
+    ble_hdr = BLE_MBUF_HDR_PTR(rxpdu);
+    memcpy(ble_hdr, &g_ble_phy_data.rxhdr, sizeof(*ble_hdr));
+}
+
+int
+ble_phy_tx_power_set(int dbm)
+{
+    /*
+     * RE limitation: the TX power register was not identified (the lib uses
+     * an enumeration level, bleConfig_t TxPower default 9, RE §7).  v1 rails
+     * and caches the value only; the RFEND default power applies.
+     * TODO(board): locate the RFEND TX power field and program it.
+     */
+    if (dbm > BLE_PHY_MAX_PWR_DBM) {
+        dbm = BLE_PHY_MAX_PWR_DBM;
+    }
+    if (dbm < -20) {
+        dbm = -20;
+    }
+    (void)dbm;
+    return 0;
+}
+
+int
+ble_phy_tx_power_round(int dbm)
+{
+    if (dbm > BLE_PHY_MAX_PWR_DBM) {
+        dbm = BLE_PHY_MAX_PWR_DBM;
+    }
+    if (dbm < -20) {
+        dbm = -20;
+    }
+    return dbm;
+}
+
+int
+ble_phy_tx_power_get(void)
+{
+    return 0;   /* see ble_phy_tx_power_set: not programmable in v1 */
+}
+
+void
+ble_phy_disable(void)
+{
+    wch_rf_shut();
+    wch_rf_auto_arm_rx(false);
+    wch_rf_encrypt_set(false);
+    g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
+    g_ble_phy_data.phy_rx_started = 0;
+    s_tx_sched_valid = 0;
+    s_rx_sched_valid = 0;
+}
+
+int
+ble_phy_rx(void)
+{
+    int rc;
+
+    if (ble_phy_state_get() != BLE_PHY_STATE_IDLE) {
+        ble_phy_disable();
+        ++g_ble_phy_stats.radio_state_errs;
+        return BLE_PHY_ERR_RADIO_STATE;
+    }
+
+    if (g_ble_phy_data.phy_encrypted) {
+        phy_encrypt_ccm_program();
+    }
+
+    /* v1 software scheduling: wait until (start - guard).  Never late-error
+     * on RX (attempt anyway, like nrf5x). */
+    if (s_rx_sched_valid) {
+        (void)wait_until_start(s_rx_sched_cputime, s_rx_sched_rem_us);
+        s_rx_sched_valid = 0;
+    }
+
+    g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
+    g_ble_phy_data.phy_rx_started = 0;
+
+    /* Arm the engine with the default window; ble_phy_wfr_enable() refines
+     * the window (LLE[0x64] is a live schedule value, RE §12.2).  Arming
+     * here also covers scan flows that never call wfr_enable. */
+    rc = wch_rf_rx_basic(g_ble_phy_rx_buf, sizeof(g_ble_phy_rx_buf),
+                         rx_window_default_half_us());
+    if (rc != 0) {
+        g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
+        ++g_ble_phy_stats.radio_state_errs;
+        return BLE_PHY_ERR_RADIO_STATE;
+    }
+
+    return 0;
+}
+
+void
+ble_phy_restart_rx(void)
+{
+    if (g_ble_phy_data.phy_state == BLE_PHY_STATE_RX) {
+        return;
+    }
+    wch_rf_rx_basic(g_ble_phy_rx_buf, sizeof(g_ble_phy_rx_buf),
+                    rx_window_default_half_us());
+    g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
+    g_ble_phy_data.phy_rx_started = 0;
+}
+
+void
+ble_phy_wfr_enable(int txrx, uint8_t tx_phy_mode, uint32_t wfr_usecs)
+{
+    uint32_t window;
+
+    (void)tx_phy_mode;  /* 1M only in v1 */
+
+    if (txrx == BLE_PHY_WFR_ENABLE_TXRX) {
+        /*
+         * Post-TX RX: with TRANSITION_TX_RX the wch_rf TX-done ISR already
+         * armed the T_IFS ACK window (RE §4.8/§5.3) - nothing to do.  If the
+         * engine is not in RX (should not happen), fall through and arm.
+         */
+        if (g_ble_phy_data.phy_state == BLE_PHY_STATE_RX) {
+            return;
+        }
+    }
+
+    if (g_ble_phy_data.phy_state != BLE_PHY_STATE_RX) {
+        g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
+        g_ble_phy_data.phy_rx_started = 0;
+        (void)wch_rf_rx_basic(g_ble_phy_rx_buf, sizeof(g_ble_phy_rx_buf),
+                              rx_window_default_half_us());
+    }
+
+    /* Refine the live RX window: LL-provided wfr + C_PHY allowance, in
+     * 0.5 us units (RE §12.1/§12.2). */
+    if (wfr_usecs > 0) {
+        window = (wfr_usecs + (g_wch_rf_timing.rx_window_widen_half_us / 2)) * 2;
+    } else {
+        window = rx_window_default_half_us();
+    }
+    WCH_LLE_WINDOW = window;
+}
+
+void
+ble_phy_rfclk_enable(void)
+{
+    /* HSE runs continuously (OSC load trim done in wch_rf_init). */
+}
+
+void
+ble_phy_rfclk_disable(void)
+{
+}
+
+int
+ble_phy_state_get(void)
+{
+    return g_ble_phy_data.phy_state;
+}
+
+uint8_t
+ble_phy_xcvr_state_get(void)
+{
+    return g_ble_phy_data.phy_state;
+}
+
+int
+ble_phy_rx_started(void)
+{
+    return g_ble_phy_data.phy_rx_started;
+}
+
+uint8_t
+ble_phy_max_data_pdu_pyld(void)
+{
+    return BLE_LL_DATA_PDU_MAX_PYLD;
+}
+
+uint32_t
+ble_phy_access_addr_get(void)
+{
+    return g_ble_phy_data.phy_access_address;
+}
+
+#if MYNEWT_VAL(BLE_LL_CFG_FEAT_LE_ENCRYPTION)
+void
+ble_phy_encrypt_enable(const uint8_t *key)
+{
+    if (key) {
+        memcpy(s_enc_key, key, 16);
+    }
+    g_ble_phy_data.phy_encrypted = 1;
+}
+
+void
+ble_phy_encrypt_header_mask_set(uint8_t mask)
+{
+    /* No RE-identified register; cached only (see phy_encrypt_ccm_program). */
+    s_enc_hdr_mask = mask;
+}
+
+void
+ble_phy_encrypt_iv_set(const uint8_t *iv)
+{
+    if (iv) {
+        memcpy(s_enc_iv, iv, 8);
+    }
+}
+
+void
+ble_phy_encrypt_counter_set(uint64_t counter, uint8_t dir_bit)
+{
+    s_enc_counter = counter;
+    s_enc_dir_bit = dir_bit;
+}
+
+void
+ble_phy_encrypt_disable(void)
+{
+    g_ble_phy_data.phy_encrypted = 0;
+    s_enc_counter = 0;
+    wch_rf_encrypt_set(false);
+}
+#endif
+
+void
+ble_phy_resolv_list_enable(void)
+{
+    g_ble_phy_data.phy_privacy = 1;
+}
+
+void
+ble_phy_resolv_list_disable(void)
+{
+    g_ble_phy_data.phy_privacy = 0;
+}
+
+/* Unconditional: upstream ble_ll_adv/conn/scan call sites are not feature-
+ * gated, so the symbol must exist even with 2M/coded disabled.  v1 clamps
+ * every mode to 1M inside wch_rf_phy_mode_set(). */
+void
+ble_phy_mode_set(uint8_t tx_phy_mode, uint8_t rx_phy_mode)
+{
+    /* Coded modes clamp to 1M in v1 (see wch_rf_phy_mode_set). */
+    wch_rf_phy_mode_set(tx_phy_mode, rx_phy_mode);
+    if (tx_phy_mode == BLE_PHY_MODE_2M) {
+        g_ble_phy_data.phy_tx_phy_mode = BLE_PHY_MODE_2M;
+    } else {
+        g_ble_phy_data.phy_tx_phy_mode = BLE_PHY_MODE_1M;
+    }
+    if (rx_phy_mode == BLE_PHY_MODE_2M) {
+        g_ble_phy_data.phy_rx_phy_mode = BLE_PHY_MODE_2M;
+    } else {
+        g_ble_phy_data.phy_rx_phy_mode = BLE_PHY_MODE_1M;
+    }
+}
+
+#if MYNEWT_VAL(BLE_LL_DTM)
+void
+ble_phy_enable_dtm(void)
+{
+    g_ble_phy_data.phy_dtm = 1;
+    wch_rf_dtm_set(true);       /* demod cfg14 0x34A4DF variant - RE §4.4 */
+}
+
+void
+ble_phy_disable_dtm(void)
+{
+    g_ble_phy_data.phy_dtm = 0;
+    wch_rf_dtm_set(false);
+}
+#endif

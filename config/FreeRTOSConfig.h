@@ -114,6 +114,6 @@ extern uint32_t SystemCoreClock;
         } \
     } while( 0 )
 
-#include "SEGGER_RTT.h"
+#include "../third_party/segger_rtt/SEGGER_RTT.h"
 
 #endif /* FREERTOS_CONFIG_H */

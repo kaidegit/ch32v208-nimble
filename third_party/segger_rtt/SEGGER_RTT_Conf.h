@@ -41,27 +41,24 @@ Purpose : User configuration file for RTT, tailored for the
 //
 // Locking for multi-task / ISR use: save & restore the MIE bit of
 // mstatus (global interrupt enable) on the RISC-V machine mode.
-// GCC (used to compile the .c files, which is where these macros are
-// expanded) supports the inline asm below.
+// NOTE: SEGGER_RTT_LOCK opens the enclosing '{' and declares the save
+// variable; SEGGER_RTT_UNLOCK consumes it and closes the block (same
+// split as SEGGER_RTT_ConfDefaults.h).
 //
 #if defined(__GNUC__) && (defined(__riscv) || defined(__riscv_xlen))
-  #define SEGGER_RTT_LOCK()  {                                             \
-                                 unsigned int _SEGGER_RTT__LockState;      \
-                                 __asm volatile ("csrr  %0, mstatus  \n\t" \
-                                                 "csrci mstatus, 8   \n\t" \
-                                                 "andi  %0, %0,  8   \n\t" \
-                                                 : "=r" (_SEGGER_RTT__LockState) \
-                                                 :                         \
-                                                 :                         \
-                                                 );                        \
-    #define SEGGER_RTT_UNLOCK()    __asm volatile ("csrr  a1, mstatus  \n\t" \
-                                                   "or    %0, %0, a1   \n\t" \
-                                                   "csrs  mstatus, %0  \n\t" \
-                                                   :                       \
-                                                   : "r"  (_SEGGER_RTT__LockState) \
-                                                   : "a1"                  \
-                                                   );                      \
-                               }
+  #define SEGGER_RTT_LOCK()  {                                            \
+      unsigned int _SEGGER_RTT__LockState;                                \
+      __asm volatile ( "csrr  %0, mstatus  \n\t"                          \
+                       "csrci mstatus, 8    \n\t"                         \
+                       "andi  %0, %0, 8     \n\t"                         \
+                       : "=r" ( _SEGGER_RTT__LockState ) : : );           \
+
+  #define SEGGER_RTT_UNLOCK()                                             \
+      __asm volatile ( "csrr  a1, mstatus  \n\t"                          \
+                       "or    %0, %0, a1    \n\t"                         \
+                       "csrs  mstatus, %0   \n\t"                         \
+                       : : "r" ( _SEGGER_RTT__LockState ) : "a1" );       \
+  }
 #endif
 
 //
