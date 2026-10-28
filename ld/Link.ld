@@ -4,10 +4,10 @@
  * Flash/RAM split configured as: 128KB code flash + 352KB data flash,
  * 64KB SRAM (the "FLASH-128K + RAM-64K" option in the WCH SDK).
  *
- * 0x0000_0000 .. 0x0007_0000  : application image (448K window; first 128K
+ * 0x0800_0000 .. 0x0807_0000  : application image (448K window; first 128K
  *                                is zero-wait-state code flash, the rest is
  *                                the re-mapped extended code region)
- * 0x0007_0000 .. 0x0007_8000  : reserved for NV data / bond storage (32K)
+ * 0x0807_0000 .. 0x0807_8000  : reserved for NV data / bond storage (32K)
  * 0x2000_0000 .. 0x2001_0000  : 64KB SRAM
  *
  * Based on the WCH EVT BLE HAL Link.ld.
@@ -21,7 +21,7 @@ PROVIDE( _stack_size = __stack_size );
 
 MEMORY
 {
-    FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 448K
+    FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 448K
     RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
 }
 

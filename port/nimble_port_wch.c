@@ -10,17 +10,18 @@
  *      before anything can post to it.
  *   2. os_mempool_module_init() + os_msys_init() - the global mbuf pools;
  *      transport/LL/host allocation depends on them.
- *   3. wch_ble_hw_init() - WCH radio bring-up: BB/LLE/RFEND registers,
+ *   3. hal_timer_init(0, NULL) + os_cputime_init(1000000) - TIM3 @ 1 MHz.
+ *      Runs before the hardware bring-up: wch_rf_init() calibration polls
+ *      and the RNG seed already consume os_cputime_get32() as their time
+ *      base, and the LL scheduler registers its first cputime callbacks
+ *      during the ble_transport_ll_init() -> ble_ll_init-complete path.
+ *   4. wch_ble_hw_init() - WCH radio bring-up: BB/LLE/RFEND registers,
  *      ble_phy_init() and the AES engine (driver agent, drivers/wch_ble/).
  *      Must precede ble_ll_init(), whose ble_phy_x/ble_hw_x callbacks may
  *      be touched from the LL task once it exists.
- *   4. ble_ll_init() - controller state, LL task event queue, RNG pool.
- *   5. ble_transport_init() - HCI buffer pools (cmd/evt; ACL/ISO pools are
+ *   5. ble_ll_init() - controller state, LL task event queue, RNG pool.
+ *   6. ble_transport_init() - HCI buffer pools (cmd/evt; ACL/ISO pools are
  *      compiled out for the native/native transport).
- *   6. hal_timer_init(0, NULL) + os_cputime_init(1000000) - TIM3 @ 1 MHz;
- *      the LL scheduler registers its first cputime callbacks during
- *      ble_transport_ll_init() -> ble_ll_init-complete path, so the timer
- *      must be running beforehand.
  *   7. ble_transport_hs_init() - registers host-side HCI dispatch.
  *   8. ble_transport_ll_init() - binds the controller to the transport;
  *      with both sides "native" this is a direct function hookup.
@@ -40,6 +41,7 @@
 #include "syscfg/syscfg.h"
 #include "os/os.h"
 #include "hal/hal_timer.h"
+#include "console/console.h"
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
 #include "nimble/transport.h"
@@ -51,6 +53,9 @@
 /* Provided by the driver agent (drivers/wch_ble/ble_hw_wch.c):
  * RF/BB/LLE/AES bring-up + ble_phy_init(). */
 extern void wch_ble_hw_init(void);
+
+/* Bring-up forensics: step-localizing tripwire checker (app/main.c). */
+extern void app_dbg_chk(const char *tag);
 
 static struct ble_npl_eventq g_eventq_dflt;
 
@@ -212,37 +217,56 @@ npl_wch_callout_reset(struct ble_npl_callout *co, ble_npl_time_t ticks)
 void
 nimble_port_init(void)
 {
+    /* Breadcrumbs (np:1..8): the bring-up saw the app-task stack pattern
+     * destroyed somewhere inside this function; these localize the step. */
+    console_printf("np:1 eventq\n");
+
     /* 1. default (host) event queue */
     ble_npl_eventq_init(&g_eventq_dflt);
+    app_dbg_chk("np:1");
 
+    console_printf("np:2 msys\n");
     /* 2. global mbuf pools */
     os_mempool_module_init();
     os_msys_init();
+    app_dbg_chk("np:2");
 
 #if NIMBLE_CFG_CONTROLLER
-    /* 3. radio + PHY bring-up (BB/LLE/RFEND/AES registers) */
-    wch_ble_hw_init();
-
-    /* 4. controller */
-    ble_ll_init();
-#endif
-
-    /* 5. HCI buffer pools */
-    ble_transport_init();
-
-#if NIMBLE_CFG_CONTROLLER
-    /* 6. cputime on TIM3 @ 1 MHz (replaces the stock 32768 Hz init) */
+    console_printf("np:3 cputime\n");
+    /* 3. cputime on TIM3 @ 1 MHz (replaces the stock 32768 Hz init).
+     * Must run before wch_ble_hw_init(): the RF driver's calibration polls
+     * (poll_reg) and the RNG seed use os_cputime_get32() as their time
+     * base - with TIM3 unconfigured it reads a constant 0 and no poll
+     * timeout can ever fire. */
     hal_timer_init(MYNEWT_VAL(OS_CPUTIME_TIMER_NUM), NULL);
     os_cputime_init(MYNEWT_VAL(OS_CPUTIME_FREQ));
+    app_dbg_chk("np:3");
+
+    console_printf("np:4 hw\n");
+    /* 4. radio + PHY bring-up (BB/LLE/RFEND/AES registers) */
+    wch_ble_hw_init();
+
+    console_printf("np:5 ll\n");
+    /* 5. controller */
+    ble_ll_init();
+    app_dbg_chk("np:5");
 #endif
 
+    console_printf("np:6 transport\n");
+    /* 6. HCI buffer pools */
+    ble_transport_init();
+
+    console_printf("np:7 hs\n");
     /* 7. host side of the transport */
     ble_transport_hs_init();
 
 #if NIMBLE_CFG_CONTROLLER
+    console_printf("np:8 ll-tr\n");
     /* 8. controller side of the transport */
     ble_transport_ll_init();
 #endif
+
+    console_printf("np: done\n");
 }
 
 void

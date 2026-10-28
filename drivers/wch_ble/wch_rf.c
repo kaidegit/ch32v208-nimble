@@ -17,7 +17,7 @@
 #include "os/os_cputime.h"
 
 #include "ch32v20x.h"       /* OSC->HSE_CAL_CTRL, BB_IRQn / LLE_IRQn */
-#include "core_riscv.h"     /* NVIC_SetPriority / NVIC_EnableIRQ     */
+#include "core_riscv.h"     /* core register access helpers          */
 
 #include "wch_rf.h"
 
@@ -588,6 +588,13 @@ bb_dev_init(void)
 int
 wch_rf_init(void)
 {
+    /* BLE IP (BB/LLE/RFEND/AES) is gated on the AHB and comes up unclocked
+     * after reset.  The EVT closed lib opens it inside BLE_LibInit(); this
+     * register-level port must do it before the first BB/LLE/RFEND access,
+     * otherwise the calibration polls below can never see their flags set.
+     * RCC_AHBPeriph_BLE_CRC = AHBPCENR bits 17/18 (BLE IP) + bit 6 (CRC). */
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_BLE_CRC, ENABLE);
+
     /* 32M crystal load capacitance and current - EXAM/BLE/HAL/MCU.c
      * WCHBLE_Init() (3 lines, verbatim). */
     OSC->HSE_CAL_CTRL &= ~(0x07UL << 28);
@@ -613,12 +620,13 @@ wch_rf_init(void)
     s_rxbuf = NULL;
     s_last_anchor = 0;
 
-    /* NVIC: BB and LLE at priority 1 (numerically lower = higher than the
-     * platform TIM3 at 2). */
-    NVIC_SetPriority(BB_IRQn, 1);
-    NVIC_SetPriority(LLE_IRQn, 1);
-    NVIC_EnableIRQ(BB_IRQn);
-    NVIC_EnableIRQ(LLE_IRQn);
+    /* BB/LLE interrupts stay DISABLED in this port (project decision): the
+     * hand-written ISRs are not validated against the closed-lib handler
+     * semantics (RE §5.2/§5.3), and with the BLE IP clocked they fired
+     * during bring-up and corrupted RAM (manifested as a bogus stack
+     * overflow in the app task).  TX completion is polled anyway
+     * (wch_rf_tx_basic busy-waits on LLE[0x64]); RX event delivery is not
+     * wired up yet. */
 
     return 0;
 }

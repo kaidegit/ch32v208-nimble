@@ -26,22 +26,28 @@
  *    tick and yield interrupts.
  *  - Enabling of BB/LLE/TIM3 in the PFIC is done by their drivers, not
  *    here; global interrupts (mstatus.MIE) are already enabled by the
- *    startup code (csrw mstatus, 0x88) before main().
+ *    startup code (csrw mstatus, 0x1888) before main().
  *******************************************************************************/
 
 #include <stdint.h>
 #include "ch32v20x.h"
 #include "SEGGER_RTT.h"
 
-/* Exceptions (hardware prologue stacking is enabled by the startup file,
- * hence the WCH-Interrupt-fast attribute, same as the SDK BLE examples). */
-void NMI_Handler( void ) __attribute__( ( interrupt( "WCH-Interrupt-fast" ) ) );
-void HardFault_Handler( void ) __attribute__( ( interrupt( "WCH-Interrupt-fast" ) ) );
+/* Plain interrupt() attribute: the compiler emits a full software
+ * prologue/epilogue.  The "WCH-Interrupt-fast" variant must only be used
+ * with HPE enabled (CSR 0x804 INTSYSCR.HWSTKEN), which QingKe V4 leaves
+ * OFF at reset and nothing in this project (or the WCH EVT examples)
+ * enables - a fast handler with HPE off clobbers the interrupted
+ * context's registers and corrupts RAM (observed as garbage writes into
+ * FreeRTOS globals during bring-up).  Plain interrupt() is correct under
+ * either HPE state (merely redundant if HPE ever gets turned on). */
+void NMI_Handler( void ) __attribute__( ( interrupt ) );
+void HardFault_Handler( void ) __attribute__( ( interrupt ) );
 
 /* Peripheral/BLE vectors (owned by the drivers, weak-called from here). */
-void TIM3_IRQHandler( void ) __attribute__( ( interrupt( "WCH-Interrupt-fast" ) ) );
-void BB_IRQHandler( void ) __attribute__( ( interrupt( "WCH-Interrupt-fast" ) ) );
-void LLE_IRQHandler( void ) __attribute__( ( interrupt( "WCH-Interrupt-fast" ) ) );
+void TIM3_IRQHandler( void ) __attribute__( ( interrupt ) );
+void BB_IRQHandler( void ) __attribute__( ( interrupt ) );
+void LLE_IRQHandler( void ) __attribute__( ( interrupt ) );
 
 /* Weak callees: real implementations arrive with the wch_ble library. */
 extern void hal_timer_wch_irq( void ) __attribute__( ( weak ) );
@@ -60,11 +66,17 @@ void NMI_Handler( void )
 }
 
 /*********************************************************************
- * HardFault_Handler: report mcause/mepc over RTT, then park.
+ * HardFault_Handler: report mcause/mepc/mtval + the kernel-variable
+ * neighborhood (pxCurrentTCB slot is the word the tick handler faults
+ * on), then park.
  *********************************************************************/
+extern void * volatile pxCurrentTCB;
+
 void HardFault_Handler( void )
 {
     uint32_t mcause, mepc, mtval;
+    volatile uint32_t * p = ( volatile uint32_t * ) &pxCurrentTCB - 12;
+    int i;
 
     __asm volatile( "csrr %0, mcause" : "=r"( mcause ) );
     __asm volatile( "csrr %0, mepc"   : "=r"( mepc ) );
@@ -72,6 +84,16 @@ void HardFault_Handler( void )
 
     SEGGER_RTT_printf( 0, "\r\n[HardFault] mcause=0x%08X mepc=0x%08X mtval=0x%08X\r\n",
                        mcause, mepc, mtval );
+    SEGGER_RTT_printf( 0, "[HardFault] tcb@%08x=%08x\r\n",
+                       ( unsigned ) ( uintptr_t ) &pxCurrentTCB,
+                       ( unsigned ) ( uintptr_t ) pxCurrentTCB );
+    for( i = 0; i < 7; i++, p += 4 )
+    {
+        SEGGER_RTT_printf( 0, "  %08x: %08x %08x %08x %08x\r\n",
+                           ( unsigned ) ( uintptr_t ) p,
+                           ( unsigned ) p[ 0 ], ( unsigned ) p[ 1 ],
+                           ( unsigned ) p[ 2 ], ( unsigned ) p[ 3 ] );
+    }
     for( ;; )
     {
     }

@@ -49,7 +49,7 @@
 |---|---|
 | WCH GCC | `riscv32-wch-elf-gcc` 15（MounRiver 发行版），默认路径 `~/DevTools/riscv32-wch-elf-gcc-15`，可用 `WCH_TOOLCHAIN_DIR` 环境变量覆盖 |
 | CMake | ≥ 3.20 |
-| probe-rs | ≥ 0.27（CH32 支持更早即有；RTT 自动发现建议 0.32+） |
+| probe-rs | ≥ 0.32（`run.sh` 使用其 debug 终端处理 WCH 启动地址） |
 | 调试器 | WCH-LinkE |
 | 目标芯片 | CH32V208WBU6（默认）/ CBU6 / RBT6，芯片名可换 |
 
@@ -58,7 +58,7 @@
 ```bash
 scripts/build.sh                 # Release 构建 → build/ch32v208_nimble.{elf,hex,bin}
 scripts/build.sh --clean         # 清理后重建
-scripts/run.sh                   # 烧录 + 复位 + RTT 日志直通（Ctrl-C 退出）
+scripts/run.sh                   # 烧录 + 设置调试入口 + RTT 日志（Ctrl-C 退出）
 scripts/attach.sh                # 只附加运行中的目标，看 RTT 不烧录
 scripts/gdb.sh                   # 起 GDB server :3333，另开终端连 riscv32-wch-elf-gdb
 ```
@@ -69,10 +69,12 @@ scripts/gdb.sh                   # 起 GDB server :3333，另开终端连 riscv3
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE=cmake/riscv32-wch.toolchain.cmake
 cmake --build build -j$(sysctl -n hw.ncpu)
-probe-rs run --chip CH32V208WBU6 build/ch32v208_nimble.elf
+probe-rs download --chip CH32V208WBU6 build/ch32v208_nimble.elf
+probe-rs debug --chip CH32V208WBU6 build/ch32v208_nimble.elf \
+    -c break -c 'wreg sp 0x20010000' -c 'wreg pc 0x08000000' -c c
 ```
 
-**probe-rs 芯片名**：与 WCH-LinkE 目标封装对应——`CH32V208WBU6`（QFN48）、`CH32V208CBU6`（QFN32）、`CH32V208RBT6`（LQFP64）。任一脚本均可用 `CHIP=xxx scripts/xxx.sh` 覆盖，无需改代码。
+**probe-rs 芯片名**：与 WCH-LinkE 目标封装对应——`CH32V208WBU6`（QFN48）、`CH32V208CBU6`（QFN32）、`CH32V208RBT6`（LQFP64）。任一脚本均可用 `CHIP=xxx scripts/xxx.sh` 覆盖，无需改代码。probe-rs 0.32 的通用 `run` 会从 `0x0` 复位并单步，而 CH32V208 调试接口不能经该别名取指，因此 `run.sh` 使用上述 `download + debug` 启动链路。
 
 ## 上板验证计划（S0–S5）
 
@@ -108,6 +110,48 @@ probe-rs run --chip CH32V208WBU6 build/ch32v208_nimble.elf
 | RFEND[40(0x28)] | =1152 | Reset 后基准值 | §3.3 |
 | AES@0x40024300 | — | 硬件 AES-128（CCM 包加密的密码原语，SM 用） | §9.7、§13.1 |
 
+## 上板调试记录（2026-10-28 bring-up）
+
+### 中断属性与 HPE（持续更新）
+
+**当前状态：startup 已改为 `INTSYSCR=0x2`（中断嵌套开、HPE 硬件压栈关），上板验证中。**
+
+- `interrupt("WCH-Interrupt-fast")` 告诉编译器“硬件会保存寄存器”，依赖 **HPE（硬件压栈）**：CSR `0x804`（INTSYSCR）bit0 `HWSTKEN`。RM 9.5.3.1 的复位值确为 0，但**本项目 startup（`startup_ch32v20x_D8W.S`）原来显式写 `0x3`（HPE+嵌套都开）**——早期“HPE 默认关、fast 属性缺保护现场”的推断前提不成立。
+- **崩溃事实链（三轮一致）**：每轮都死在 `hw: rng_seed` 打印后 ~1 ms 内，`mcause=4`、`mtval=0x7B21AF17`；反汇编定位在 `xTaskIncrementTick`（tasks.c:2853）读 `pxCurrentTCB->uxPriority`——即 `pxCurrentTCB`（0x2000036C）被写成 `0x7B21AEEB`（= mtval−44，TCB 内 uxPriority 偏移）。该值跨构建、跨运行**完全确定**，且不在 flash 镜像里。rng_seed 阶段纯软件部分（xorshift、UID/MAC 只读）无任何野写路径，SDK ADC 调用只写外设寄存器 ⇒ 写入者是**异步的**。
+- **当前主嫌疑：HPE × mscratch 交换式 FreeRTOS port**。WCH 的 port 在 `SW_Handler`/`xPortStartFirstTask`（portASM.S）里**软件**搬运 sp/mscratch 跨上下文切换；HPE 开着时，中断入口的硬件压栈/出栈与这种 sp 移动交错，可能把寄存器帧落到错误位置（值确定：帧内容就是被打断上下文的寄存器）。portASM.S 里 WCH 自己留了一行被注释的 `csrs 0x804, 0x20 /* Disable HPE */`，说明他们知道有相互作用。
+- **处置（2026-10-28）**：startup 改写 `0x2`——只关 HPE（bit0），保留嵌套（bit1）。安全性已核对：portASM.S `SW_Handler` 软件保存全部 x1/x5–x31+mstatus，port.c `SysTick_Handler` 是普通 `interrupt()` + 对称的 mscratch 交换，本工程全部 handler 也是普通 `interrupt()`，均不依赖 HPE 入口帧。banner 新增 `intcfg` 行实读 INTSYSCR 自证。**若关 HPE 后崩溃消失即定案；若仍在，下一步在 rng_seed 各子步骤间布 `pxCurrentTCB`/canary 打点取证。**
+- 教训（仍然有效）：fast 属性的正确性依赖 HPE 状态与 port 的配合，本项目一律用普通 `interrupt()`；改成普通属性本身无害（该修复后崩溃依旧，说明它只是必要非充分）。
+### 根因（2026-10-28 23:46 破案）：RNG 种子无限递归炸栈
+
+`ble_hw_rng_seed()`（原始版）结尾先做 4 次 `ble_hw_rng_read()`、**之后**才置 `g_rng_seeded=1`；而 `ble_hw_rng_read()` 在 `!g_rng_seeded` 时回调 `ble_hw_rng_seed()` —— seed→read→seed→read **无限递归**。每层 ~150–350 B（ADC 采样帧 + UID/MAC 读取 + 64 位种子运算 + printf 320 B 帧），把 app 任务 4 KB 静态栈吃穿后继续向下碾进 .bss：`g_app_zone` 哨兵、白名单走廊、FreeRTOS 内核变量（`pxCurrentTCB` @0x2000036C）、`ucHeap`、直到 `_SEGGER_RTT` @0x2000A230 —— 与全部观测足迹吻合（"栈溢出 hw=0"、RTT 通道描述符损坏、heap_4.c:292 free 断言、mcause=4 读 `pxCurrentTCB` 崩溃、崩溃点永远在 `hw: rng_seed` 打印后 ~1 ms）。
+
+- **神秘确定值 0x7B21AF17 的来历**：banner 实测 `uid0 = 0x7B21AEEB`（0x1FFFF7E8）。HPE 开着那几轮 `pxCurrentTCB` 被写的正是 uid0——`FLASH_GetMACAddress` 每层递归都把 uid0 装进局部 `value`，递归栈以固定布局下降，某一深度的 `value` 槽位恰好落在 0x2000036C，于是同一值每轮稳定复现；代码布局一变（如关 HPE/加插桩后），那个槽位装的是别的中间值（0x34D9BBAD）。所谓"跨构建确定的垃圾值"其实是"每布局确定的栈内容"。
+- **教训**：`-fstack-usage` 只能证单帧深度，排除不了**无界递归**；"hw=0（A5 全毁）"从一开始就在说真话（真·栈耗尽），被"最大帧仅 320 B"带偏了方向。
+- **修复**：`g_rng_seeded = 1` 移到 discard 读之前（`drivers/wch_ble/ble_hw_wch.c`）。
+- **HPE 调查结论保留**：startup 原写 `INTSYSCR=0x3`（HPE+嵌套开）确为真实风险面（与 mscratch 交换式 port 的相互作用未验证），已改 `0x2` 关闭且全链路核对安全；但它不是本次崩溃的原因（hpe=0 时崩溃依旧）。中断属性一律普通 `interrupt()` 的规矩不变。
+
+### Flash / SRAM 配置与 ld 的对齐（依据：CH32FV2x_V3xRM V2.5、CH32V208DS0）
+
+- **总量 480 KB**（RM 表 32-4"总共 480K 字节的主存储器"），地址 `0x08000000..0x08077FFF`（1920 页 × 256 B）。`ld/Link.ld` 的 448 K 是 EVT BLE 工程的软件约定：顶部 32 K（`0x08070000+`）预留给 BLE NV/绑定数据，不是硬件边界。
+- **零等待窗口与划分**：480 K = 零等待应用区 + 非零等待数据区（DS 表 2-1 注 1），分界由**用户选择字 USER[7:5]（RAM_CODE_MOD）**决定（RM 表 32-4，仅 D8/D8W 系列）：`00x = CODE-128K + RAM-64K`（**出厂默认**）、`01x = CODE-144K + RAM-48K`、`1xx = CODE-160K + RAM-32K`。复位后从 `0x1FFFF800` 选字区装载，运行时只读 `FLASH_OBR`（`0x4002201C`）bits[9:7] 即当前模式。
+- **ld 假设 = 出厂默认**（128K 零等待 + 64K SRAM）。若选字被改过（如 160K+32K），ld 仍按 64K 布局，高地址全局变量落在不存在的 RAM 上——上板 banner 已加 `memcfg` 行实读 OBR/`ram_code_mod`/ESIG `F_SIZE`（`0x1FFFF7E0`，KB 单位）自证。
+- **非零等待区可执行**（RM 32.3"FLASH 增强读模式"，用户代码可超出 CODE 窗口运行），但慢；跨区后建议置 `FLASH_CTLR.EHMOD`（`0x40022010` bit24），擦写/进停止模式前必须退出。**当前镜像 ~130 KB，距 128 K 零等待窗口余量已不足 1 KB**，继续增长即跨区。
+- **Flash 访问时钟 ≤ 60 MHz**（RM 32.1 注 2 / `FLASH_CTLR` bit25 `SCKMOD`，复位值 0 = SYSCLK/2）：96 MHz 主频下默认即 48 MHz，合规；不要置 SCKMOD=1。
+- **SRAM**：`0x20000000..0x20010000` 连续 64 KB，无分段、无需使能（RCC_AHBPCENR.SRAMEN 复位 1，仅管睡眠时钟）。坑：**待机模式默认不保 RAM**（PWR_CTLR R30KSTY/R2KSTY 复位 0，睡前显式置位最多保持 32 K）。
+- **ESIG**（RM 第 31 章）：`0x1FFFF7E0` = F_SIZE（可用代码区 KB 数），`0x1FFFF7E8/EC/F0` = 96 位 UID（`FLASH_GetMACAddress` 即取自这里）；选字区 `0x1FFFF800`：byte0 RDPR（出厂 0xA5）、byte2 USER。
+- **实测（2026-10-28）**：本板 OBR=0x03FFFCFC，RAM_CODE_MOD=0b001——属 **00x 组 = CODE-128K + RAM-64K，与出厂默认同划分**（值 1 与 0 等价，[2:1] 位才是模式位）；`fsize=160K` 是该料零等待容量标识，不改变划分。**结论：划分与 ld 一致，无需修复。** 曾误按 `mode != 0` 触发过一次不必要的选项字节重编程并中断于半途；现改为按模式位 `(mode & 0x6) != 0` 判断，且修复路径先切到当前模式有效 RAM 顶部的临时栈（SDK 的 `FLASH_ProgramOptionByteData` 从栈上 pbuf 回写全部半字，不能跑在无效栈上）。
+
+### bring-up 修复清单（前两轮）
+
+| 问题 | 现象 | 修复 |
+|---|---|---|
+| BLE IP AHB 时钟未使能 + cputime 初始化晚于 RF 驱动 | 卡死在 `ble: bringing up`（校准 poll 无超时死循环：TIM3 未配时 `os_cputime_get32()` 恒 0） | `wch_rf_init()` 首行 `RCC_AHBPeriphClockCmd(RCC_AHBPeriph_BLE_CRC, ENABLE)`；`nimble_port_init()` 把 cputime/TIM3 初始化提前到 RF 硬件之前 |
+| app 任务栈 512 words 过小 | 首轮真·栈溢出（实测 init 链 ~1.5 KB） | 改静态栈 1024 words（`g_app_zone` 哨兵取证区），`configSUPPORT_STATIC_ALLOCATION=1` |
+| BB/LLE NVIC 使能（按项目决策保持关闭） | 中断关闭后"溢出"仍复现，证明写手另有其人（见上节 HPE 主嫌疑，验证中） | `wch_rf_init()` 不再 `NVIC_EnableIRQ(BB/LLE)`；TX 完成走轮询，RX 事件通路留待后续 |
+| `WCH-Interrupt-fast` 属性（当时误判 HPE 为关） | RAM 野写（`pxCurrentTCB` 被写残值）→ 栈溢出假象 / mcause=4 HardFault；改后崩溃依旧 | 全部 handler 改普通 `interrupt()`——无害且必要，但非根因（见上节） |
+| startup 开 HPE（`INTSYSCR=0x3`）× mscratch 交换式 port | 同上崩溃，三轮确定值 0x7B21AEEB，异步写入者 | startup 改 `0x2`（关 HPE、留嵌套），banner `intcfg` 行自证——验证中 |
+| **RNG 种子无限递归（seed→read→seed，`g_rng_seeded` 置位过晚）——根因** | 三轮 mcause=4 + "栈溢出 hw=0" + RTT CB/堆损伤；`pxCurrentTCB` 值=uid0（0x7B21AEEB） | `g_rng_seeded=1` 提前到 discard 读之前；`app_dbg_chk()` 五路 canary 插桩保留观察 |
+
 ## 与 trouble(Rust) 路线的关系
 
 同一验证目标（CH32V208 BLE 硬件 + 全开源栈）的 C 快速路径：本工程用 NimBLE 先把硬件调通，寄存器事实与驱动可直接迁移给 [TROUBLE_CH32V208_PORTING.md](../../TROUBLE_CH32V208_PORTING.md) 描述的 Rust trouble-host + 自研 controller 路线。
@@ -123,6 +167,7 @@ probe-rs run --chip CH32V208WBU6 build/ch32v208_nimble.elf
 
 ## 已知限制与待上板校准项
 
+- **镜像逼近 128K 零等待窗口**：RAM_CODE_MOD=000（出厂默认）时 CODE 区仅 128 K，当前镜像 ~130 K、余量 <1 K；继续增长将跨入非零等待区（可执行但慢），届时按 RM 32.3 开 `FLASH_CTLR.EHMOD`，擦写/停止模式前退出（详见"Flash / SRAM 配置"节）。
 - **LLE[0x1C]/[0x64] 单位未实测**：超时/自旋计数按逆向推断的 LLE tick 使用，上板后需用逻辑分析仪/RTT 计时校准（RE findings §3.2、§4.3）。
 - **auto-ack 未启用**：v1 收发走手动模式字序列（BB[0x2C] arm 位留待 S3 后开启自动应答）。
 - **RNG 非安全熵源**：控制器随机数来自硬件 LFSR 类源，可用于地址生成，**不可**作为配对/加密密钥熵源（SM v1 未启用，见下）。

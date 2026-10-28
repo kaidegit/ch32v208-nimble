@@ -5,8 +5,8 @@
  * except for this banner.  SYSCLK_FREQ_96MHz_HSE is the only enabled
  * option: 32 MHz HSE x3 = 96 MHz core clock, the same setting used by
  * the WCH BLE examples for the CH32V208 (D8W) die.
- * No VECT_TAB relocation code: the vector table stays at 0x00000000
- * (VTOR = 0, matching ld/Link.ld FLASH origin).
+ * No VECT_TAB relocation code: the vector table uses the reset mapping;
+ * ld/Link.ld links FLASH through its debug-accessible alias at 0x08000000.
  * SystemCoreClockUpdate() tracks the programmed PLL frequency.
  */
 /********************************** (C) COPYRIGHT *******************************

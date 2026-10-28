@@ -66,6 +66,7 @@ extern uint32_t SystemCoreClock;
 #define configUSE_MUTEXES               1
 #define configQUEUE_REGISTRY_SIZE       8
 #define configCHECK_FOR_STACK_OVERFLOW  2
+#define configSUPPORT_STATIC_ALLOCATION 1
 #define configUSE_RECURSIVE_MUTEXES     1
 #define configUSE_MALLOC_FAILED_HOOK    1
 #define configUSE_APPLICATION_TASK_TAG  0
@@ -97,6 +98,7 @@ extern uint32_t SystemCoreClock;
 #define INCLUDE_xTaskAbortDelay             0
 #define INCLUDE_xTaskGetHandle              0
 #define INCLUDE_xSemaphoreGetMutexHolder    1
+#define INCLUDE_uxTaskGetStackHighWaterMark 1
 
 /* vApplicationMallocFailedHook() / vApplicationStackOverflowHook() are
  * provided by app/main.c (hooks enabled above; no prototypes here since

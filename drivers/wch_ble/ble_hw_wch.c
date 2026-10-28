@@ -16,6 +16,7 @@
 
 #include "syscfg/syscfg.h"
 #include "os/os_cputime.h"
+#include "console/console.h"
 #include "nimble/ble.h"
 #include "nimble/nimble_opt.h"
 #include "controller/ble_hw.h"
@@ -43,7 +44,9 @@ struct wch_whitelist_entry
     uint8_t valid;
 };
 
-static struct wch_whitelist_entry g_wch_whitelist[BLE_WCH_WHITE_LIST_SIZE];
+/* NOT static during bring-up: app/main.c app_dbg_chk() uses this as a
+ * zero-init .bss canary (nothing writes it before a whitelist op). */
+struct wch_whitelist_entry g_wch_whitelist[BLE_WCH_WHITE_LIST_SIZE];
 static uint8_t g_wch_whitelist_enabled;
 
 uint8_t
@@ -191,15 +194,22 @@ static ble_rng_isr_cb_t g_rng_cb;
 static int g_rng_started;
 
 /* One ADC sample of the internal temperature sensor (simplified
- * HAL_GetInterTempValue sequence, EXAM/BLE/HAL). */
+ * HAL_GetInterTempValue sequence, EXAM/BLE/HAL).  *ok = 0 if the
+ * conversion never completed (EOC timeout). */
 static uint16_t
-adc_temp_sample(void)
+adc_temp_sample(int *ok)
 {
     ADC_InitTypeDef init;
     uint32_t guard = 200000;
     uint16_t v = 0;
 
+    /* ADC_StructInit leaves ADC_OutputBuffer/ADC_Pga UNfilled - without
+     * this memset, stack garbage is OR'd into ADC1->CTLR1 by ADC_Init. */
+    memset(&init, 0, sizeof(init));
+
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE);
+    /* ADC clock must be <= 14 MHz (RM ch. ADC); PCLK2 is 96 MHz here. */
+    RCC_ADCCLKConfig(RCC_PCLK2_Div8);
     ADC_TempSensorVrefintCmd(ENABLE);
     ADC_StructInit(&init);
     init.ADC_ScanConvMode = DISABLE;
@@ -214,6 +224,9 @@ adc_temp_sample(void)
     }
     if (guard) {
         v = ADC_GetConversionValue(ADC1);
+        *ok = 1;
+    } else {
+        *ok = 0;
     }
     ADC_Cmd(ADC1, DISABLE);
     ADC_TempSensorVrefintCmd(DISABLE);
@@ -221,9 +234,8 @@ adc_temp_sample(void)
 }
 
 static void
-ble_hw_rng_seed(void)
+ble_hw_rng_seed_with(uint16_t temp)
 {
-    uint16_t temp = adc_temp_sample();
     uint8_t mac[6];
     uint32_t uid0;
     uint32_t uid1;
@@ -246,13 +258,27 @@ ble_hw_rng_seed(void)
     if ((g_rng_state[0] == 0) && (g_rng_state[1] == 0)) {
         g_rng_state[0] = 0x9E3779B97F4A7C15ULL;
     }
+    /* Mark seeded BEFORE the discard reads: ble_hw_rng_read() calls
+     * ble_hw_rng_seed() when !g_rng_seeded - setting the flag after the
+     * reads made seed -> read -> seed -> ... recurse without bound and
+     * eat the whole task stack into .bss (the bring-up's entire
+     * "deterministic RAM corruption" saga, see README). */
+    g_rng_seeded = 1;
     /* Discard a few outputs to wash out seed correlations. */
     (void)ble_hw_rng_read();
     (void)ble_hw_rng_read();
     (void)ble_hw_rng_read();
     (void)ble_hw_rng_read();
+}
 
-    g_rng_seeded = 1;
+static void
+ble_hw_rng_seed(void)
+{
+    int ok = 0;
+    uint16_t temp = adc_temp_sample(&ok);
+
+    console_printf("rng: adc=%u ok=%d\r\n", temp, ok);
+    ble_hw_rng_seed_with(temp);
 }
 
 static uint64_t
@@ -392,13 +418,42 @@ ble_hw_get_static_addr(ble_addr_t *addr)
 /* Platform bring-up entry (called by port/nimble_port_wch.c)                */
 /* ------------------------------------------------------------------------- */
 
+/* Bring-up forensics: step-localizing tripwire checker (app/main.c). */
+extern void app_dbg_chk(const char *tag);
+
 void
 wch_ble_hw_init(void)
 {
-    /* wch_rf_init(): RE §3 + §6 init + calibration + NVIC BB/LLE prio 1 */
+    int adc_ok = 0;
+    uint16_t temp;
+
+    app_dbg_chk("hw:pre");
+
+    /* ADC FIRST, deliberately before the BLE IP is even clocked: if the
+     * canaries go bad right after this step the ADC path is implicated
+     * with the radio excluded; if they survive until after wch_rf_init()
+     * the radio/calibration window is the suspect instead. */
+    console_printf("hw: adc\n");
+    temp = adc_temp_sample(&adc_ok);
+    console_printf("hw: adc=%u ok=%d\r\n", temp, adc_ok);
+    app_dbg_chk("hw:adc");
+
+    console_printf("hw: rf_init\n");
     (void)wch_rf_init();
-    /* NimBLE PHY layer state + ISR callback wiring */
+    app_dbg_chk("hw:rf");
+
+    console_printf("hw: phy_init\n");
     (void)ble_phy_init();
-    /* Seed the (weak) software RNG once at boot */
-    ble_hw_rng_seed();
+    app_dbg_chk("hw:phy");
+
+    console_printf("hw: rng_seed\n");
+    /* Seed the (weak) software RNG once at boot - the ADC sample is
+     * taken above so the checker brackets it separately. */
+    console_printf("rng: uid=%08x %08x\r\n",
+                   *(volatile uint32_t *)0x1FFFF7E8UL,
+                   *(volatile uint32_t *)0x1FFFF7ECUL);
+    ble_hw_rng_seed_with(temp);
+    app_dbg_chk("hw:seed");
+
+    console_printf("hw: done\n");
 }

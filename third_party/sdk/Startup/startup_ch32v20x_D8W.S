@@ -256,11 +256,17 @@ handle_reset:
 /* Configure pipelining and instruction prediction */
     li t0, 0x1f
     csrw 0xbc0, t0
-/* Enable interrupt nesting and hardware stack */
-	li t0, 0x3
+/* INTSYSCR(0x804): bit1 INESTEN=1 keeps interrupt nesting, bit0 HWSTKEN=0
+ * DISABLES the HPE hardware prologue.  The EVT default was 0x3 (HPE on).
+ * The FreeRTOS port in third_party/freertos moves sp/mscratch in software
+ * across context switches (SW_Handler, xPortStartFirstTask) and every
+ * handler here is a plain interrupt() function that saves its own
+ * registers, so HPE push/pop is redundant - and was the prime suspect for
+ * the deterministic RAM corruption seen during bring-up.  Keep OFF. */
+	li t0, 0x2
 	csrw 0x804, t0
 /* Enable global interrupt and configure privileged mode */
-   	li t0, 0x88           
+    li t0, 0x1888
    	csrw mstatus, t0
 /* Configure the interrupt vector table recognition mode and entry address mode */
  	la t0, _vector_base

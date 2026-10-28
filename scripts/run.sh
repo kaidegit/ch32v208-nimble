@@ -2,13 +2,13 @@
 #
 # run.sh - flash + run the firmware under probe-rs and stream RTT logs.
 #
-# probe-rs (>= 0.27) auto-discovers the WCH-LinkE probe and the RTT control
-# block in the ELF, so SEGGER RTT output is forwarded to this terminal.
+# probe-rs auto-discovers the WCH-LinkE probe and the RTT control block in
+# the ELF. Extra args are forwarded to probe-rs download.
 #
 # Usage:
 #   scripts/run.sh
 #   CHIP=CH32V208CBU6 scripts/run.sh    # override chip name
-#   scripts/run.sh --noreset            # extra args are forwarded to probe-rs
+#   scripts/run.sh --verify             # verify the flashed firmware
 set -euo pipefail
 
 PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,5 +27,14 @@ echo
     echo "firmware not found: ${ELF} (run scripts/build.sh first)" >&2; exit 1;
 }
 
-# probe-rs run = flash + reset + attach RTT; Ctrl-C detaches.
-exec probe-rs run --chip "${CHIP}" "$@" "${ELF}"
+echo "[run] flashing ${ELF}"
+probe-rs download --chip "${CHIP}" "$@" "${ELF}"
+
+# probe-rs 0.32 resets to 0x0 and then single-steps. The CH32V208 debug
+# interface cannot fetch through that alias; start through 0x08000000 instead.
+echo "[run] starting through 0x08000000; Ctrl-C detaches"
+exec probe-rs debug --chip "${CHIP}" "${ELF}" \
+    -c break \
+    -c "wreg sp 0x20010000" \
+    -c "wreg pc 0x08000000" \
+    -c c
