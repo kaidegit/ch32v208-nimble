@@ -160,6 +160,9 @@ add_executable(ch32v208_nimble
     app/system_ch32v20x.c
     ${SDK_DIR}/Startup/startup_ch32v20x_D8W.S
 )
+# .elf suffix so scripts/ and probe-rs commands can reference
+# build/ch32v208_nimble.elf verbatim.
+set_target_properties(ch32v208_nimble PROPERTIES SUFFIX ".elf")
 # wch_ble and nimble_core reference each other (LL calls ble_phy_*, the PHY
 # port calls ble_ll_*), so the archives must be rescanned as a group.
 target_link_libraries(ch32v208_nimble
@@ -191,6 +194,7 @@ add_executable(boot
     app/system_ch32v20x.c
     ${SDK_DIR}/Startup/startup_ch32v20x_D8W.S
 )
+set_target_properties(boot PROPERTIES SUFFIX ".elf")
 target_link_libraries(boot PRIVATE sdk_periph freertos_kernel segger_rtt)
 target_include_directories(boot PRIVATE app port)
 target_link_options(boot PRIVATE
