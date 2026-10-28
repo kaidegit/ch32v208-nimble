@@ -13,6 +13,7 @@
  */
 
 #include <sys/stat.h>
+#include <sys/reent.h>
 #include <sys/time.h>
 #include <errno.h>
 #include <stdint.h>
@@ -136,6 +137,84 @@ off_t _lseek( int fd, off_t pos, int whence )
     ( void ) whence;
     errno = ESPIPE;
     return ( off_t ) -1;
+}
+
+/*--------------------------------------------------------------------*/
+/* Re-entrant syscall family (_r variants).                            */
+/*                                                                     */
+/* newlib's libc calls the _r versions internally (malloc -> _sbrk_r,  */
+/* stdio -> _write_r, ...).  Without these, libc links its OWN default */
+/* wrappers, which on riscv are LINUX SYSTEM CALLS (li a7,SYS_x; ecall)*/
+/* - on bare metal every first heap allocation or stdio use raised an  */
+/* ecall exception that landed in a weak-vector spin loop: the entire  */
+/* "silent hang after np:8" class of bring-up crashes.                  */
+/*--------------------------------------------------------------------*/
+
+void * _sbrk_r( struct _reent * r, ptrdiff_t incr )
+{
+    char * ret;
+
+    ret = _sbrk( incr );
+    if( ret == ( char * ) -1 )
+    {
+        r->_errno = ENOMEM;
+    }
+    return ret;
+}
+
+ssize_t _write_r( struct _reent * r, int fd, const void * buf, size_t len )
+{
+    ( void ) r;
+    return _write( fd, buf, len );
+}
+
+ssize_t _read_r( struct _reent * r, int fd, void * buf, size_t len )
+{
+    ( void ) r;
+    return _read( fd, buf, len );
+}
+
+int _open_r( struct _reent * r, const char * path, int flags, int mode )
+{
+    ( void ) r; ( void ) path; ( void ) flags; ( void ) mode;
+    errno = ENOSYS;
+    return -1;
+}
+
+int _close_r( struct _reent * r, int fd )
+{
+    ( void ) r;
+    return _close( fd );
+}
+
+int _fstat_r( struct _reent * r, int fd, struct stat * st )
+{
+    ( void ) r;
+    return _fstat( fd, st );
+}
+
+int _isatty_r( struct _reent * r, int fd )
+{
+    ( void ) r;
+    return _isatty( fd );
+}
+
+off_t _lseek_r( struct _reent * r, int fd, off_t pos, int whence )
+{
+    ( void ) r;
+    return _lseek( fd, pos, whence );
+}
+
+int _kill_r( struct _reent * r, int pid, int sig )
+{
+    ( void ) r;
+    return _kill( pid, sig );
+}
+
+int _getpid_r( struct _reent * r )
+{
+    ( void ) r;
+    return _getpid();
 }
 
 /*--------------------------------------------------------------------*/

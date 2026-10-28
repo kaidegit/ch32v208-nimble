@@ -58,19 +58,6 @@ extern void wch_ble_hw_init(void);
 /* Bring-up forensics: step-localizing tripwire checker (app/main.c). */
 extern void app_dbg_chk(const char *tag);
 
-/* Program a QingKe trigger-module store watchpoint on 'addr'.  Any store
- * to it raises a breakpoint exception (HardFault), whose mepc names the
- * writing instruction.  Used on pool_evt's block-size word: written once
- * by os_mempool_init, never again by legitimate code. */
-void wch_watch_store(uint32_t addr)
-{
-    /* tselect=0x7a0, tdata1=0x7a1, tdata2=0x7a2 (RV32 trigger module) */
-    __asm__ volatile ("csrw 0x7a0, zero");            /* trigger 0 */
-    /* mcontrol: type=2, M=1, store=1, load=0, action=0 (exception) */
-    __asm__ volatile ("li t0, 0x20000042; csrw 0x7a1, t0" ::: "t0");
-    __asm__ volatile ("csrw 0x7a2, %0" :: "r" (addr));
-}
-
 static struct ble_npl_eventq g_eventq_dflt;
 
 extern void os_msys_init(void);
@@ -78,10 +65,6 @@ extern void os_mempool_module_init(void);
 #if NIMBLE_CFG_CONTROLLER
 extern void ble_ll_init(void);
 #endif
-
-/* RAM word backing the compile-only SCB shim (config/npl_wch_scb.h).  It
- * never becomes non-zero; real ISR detection lives in npl_wch_in_isr(). */
-volatile uint32_t g_npl_wch_scb_shim;
 
 /* ------------------------------------------------- NPL ISR-safe helpers */
 
@@ -225,6 +208,22 @@ npl_wch_callout_reset(struct ble_npl_callout *co, ble_npl_time_t ticks)
 
     return npl_freertos_callout_reset(co, ticks);
 }
+
+
+
+
+
+extern void os_msys_init(void);
+extern void os_mempool_module_init(void);
+#if NIMBLE_CFG_CONTROLLER
+extern void ble_ll_init(void);
+#endif
+
+/* RAM word backing the compile-only SCB shim (config/npl_wch_scb.h).  It
+ * never becomes non-zero; real ISR detection lives in npl_wch_in_isr(). */
+volatile uint32_t g_npl_wch_scb_shim;
+
+
 
 /* ----------------------------------------------------- nimble_port API */
 

@@ -24,7 +24,7 @@ _vector_base:
     .word   _start
     .word   wch_exc_trap               /* exc 1 - was 0: any fault here jumped to 0 */
     .word   NMI_Handler                /* NMI */
-    .word   HardFault_Handler          /* Hard Fault */
+    .word   wch_exc_trap               /* Hard Fault slot: raw trap while hunting the wild jump */
     .word   wch_exc_trap               /* exc 4: load/store access fault -> mepc captured */
     .word   Ecall_M_Mode_Handler       /* Ecall M Mode */
     .word   wch_exc_trap               /* exc 6 */
@@ -254,8 +254,10 @@ wch_exc_trap:
 	sw   t1, 4(t3)
 	sw   t2, 8(t3)
 	sw   t4, 12(t3)
-	mv   t0, gp
+	mv   t0, ra
 	sw   t0, 16(t3)
+	mv   t0, gp
+	sw   t0, 20(t3)
 1:	j 1b
 
 	.section	.text.handle_reset,"ax",@progbits

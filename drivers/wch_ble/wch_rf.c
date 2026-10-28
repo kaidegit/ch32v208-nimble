@@ -605,14 +605,30 @@ wch_rf_init(void)
     lle_dev_init();
     rfend_dev_init();
     bb_dev_init();
+    {
+        extern void app_dbg_chk(const char *);
+        app_dbg_chk("rf:dev");
+    }
 
     /* First-shot analog calibration, same primitive order as the periodic
      * calibration of RE §6.3. */
     rfend_txctune();
+    {
+        extern void app_dbg_chk(const char *);
+        app_dbg_chk("rf:txctune");
+    }
     rfend_txftune();
     rfend_rxfilter();
+    {
+        extern void app_dbg_chk(const char *);
+        app_dbg_chk("rf:rxfilter");
+    }
     rfend_rxadc();
     rfend_set_sensitivity();
+    {
+        extern void app_dbg_chk(const char *);
+        app_dbg_chk("rf:cal-done");
+    }
 
     s_channel = 0xFF;
     s_rx_armed = false;

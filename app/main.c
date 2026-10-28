@@ -251,6 +251,45 @@ static void app_task( void * pvParameters )
     }
 }
 
+    /* Bring-up forensics: trigger-module store watchpoint helpers (used by
+ * main.c and the npl port; must live in a file both targets link). */
+/* Program a QingKe trigger-module store watchpoint on 'addr'.  Any store
+ * to it raises a breakpoint exception (HardFault), whose mepc names the
+ * writing instruction.  Used on pool_evt's block-size word: written once
+ * by os_mempool_init, never again by legitimate code. */
+void wch_watch_store(uint32_t addr)
+{
+    /* tselect=0x7a0, tdata1=0x7a1, tdata2=0x7a2 (RV32 trigger module) */
+    __asm__ volatile ("csrw 0x7a0, zero");            /* trigger 0 */
+    /* mcontrol: type=2, M=1, store=1, load=0, action=0 (exception) */
+    __asm__ volatile ("li t0, 0x20000042; csrw 0x7a1, t0" ::: "t0");
+    __asm__ volatile ("csrw 0x7a2, %0" :: "r" (addr));
+}
+
+/* Execute-breakpoint at addr: fires when the PC matches.  With action=0
+ * this raises a breakpoint exception (vector slot 3 -> wch_exc_trap). */
+void wch_watch_exec(uint32_t addr)
+{
+    __asm__ volatile ("csrw 0x7a0, zero");
+    __asm__ volatile ("li t0, 0x20000041; csrw 0x7a1, t0" ::: "t0");
+    __asm__ volatile ("csrw 0x7a2, %0" :: "r" (addr));
+}
+
+/* Calibration: does the trigger module exist and hold writes?  Prints
+ * tinfo and a write/readback of tdata1 with a disabled type. */
+void wch_watch_probe(void)
+{
+    uint32_t info = 0, rb = 0, sel = 0;
+
+    __asm__ volatile ("csrr %0, 0x7a4" : "=r" (info));
+    __asm__ volatile ("csrw 0x7a0, zero");
+    __asm__ volatile ("li t0, 0x60000000; csrw 0x7a1, t0" ::: "t0");
+    __asm__ volatile ("csrr %0, 0x7a1" : "=r" (rb));
+    __asm__ volatile ("csrr %0, 0x7a0" : "=r" (sel));
+    SEGGER_RTT_printf( 0, "trg: tinfo=%08x sel=%08x tdata1rb=%08x\r\n",
+                       ( unsigned ) info, ( unsigned ) sel, ( unsigned ) rb );
+}
+
 int main( void )
 {
     /* SystemInit() already ran from the reset handler; refresh the
@@ -296,6 +335,14 @@ int main( void )
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7E8UL,
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7ECUL,
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7F0UL );
+
+/* Bring-up forensics: trigger-module calibration + execute-breakpoint
+     * at PC=0x0.  When the phantom wild jump lands, slot-3 vectors into the
+     * raw exc trap which stashes ra = the culprit call site. */
+    {
+        extern void wch_watch_probe(void);
+        wch_watch_probe();
+    }
 
     /* Bring-up forensics: varargs battery.  The silent deaths all landed on
      * the FIRST argument-carrying console_printf (vsnprintf %p path) and
