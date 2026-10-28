@@ -235,6 +235,82 @@ void vPortEndScheduler( void )
 void SysTick_Handler(void) __attribute__((interrupt()));
 void SysTick_Handler( void )
 {
+    /* Bring-up forensics: sample the interrupted PC every 64 ticks.  A
+     * silent spin anywhere (task or deep call) shows up as a cluster of
+     * identical sampled PCs.  Remove after the bring-up. */
+    {
+        static unsigned s_smp_cnt;
+        static const char hx[] = "0123456789abcdef";
+        /* Valid pxCurrentTCB values during bring-up: the three static TCBs
+         * (idle / app / timer).  Anything else = the .bss sprayer struck. */
+        extern const void * const g_tcb_addrs[ 3 ];
+        extern void * volatile pxCurrentTCB;
+
+        extern char __global_pointer$[];
+        uint32_t gpv;
+        __asm volatile( "mv %0, gp" : "=r"( gpv ) );
+
+        uint32_t tcb = ( uint32_t ) pxCurrentTCB;
+        uint32_t tick = ++s_smp_cnt;
+        uint32_t v;
+        int i;
+        int bad = ( tcb != ( uint32_t ) g_tcb_addrs[ 0 ] ) &&
+                  ( tcb != ( uint32_t ) g_tcb_addrs[ 1 ] ) &&
+                  ( tcb != ( uint32_t ) g_tcb_addrs[ 2 ] );
+
+        __asm volatile( "csrr %0, mepc" : "=r"( v ) );
+
+        if( ( uint32_t ) gpv != ( uint32_t ) __global_pointer$ )
+        {
+            char gbuf[ 40 ] = "[gp!] t=...... gp=........ pc=........\r\n";
+
+            for( i = 0; i < 6; i++ )
+            {
+                gbuf[ 8 + i ] = hx[ ( tick >> ( 20 - 4 * i ) ) & 0xFU ];
+            }
+            for( i = 0; i < 8; i++ )
+            {
+                gbuf[ 17 + i ] = hx[ ( gpv >> ( 28 - 4 * i ) ) & 0xFU ];
+            }
+            for( i = 0; i < 8; i++ )
+            {
+                gbuf[ 30 + i ] = hx[ ( v >> ( 28 - 4 * i ) ) & 0xFU ];
+            }
+            SEGGER_RTT_WriteString( 0, gbuf );
+        }
+
+        if( bad )
+        {
+            char buf[ 40 ] = "[tcb!] t=...... tcb=........ pc=........\r\n";
+            uint32_t t = tick;
+
+            for( i = 0; i < 6; i++ )
+            {
+                buf[ 8 + i ] = hx[ ( t >> ( 20 - 4 * i ) ) & 0xFU ];
+            }
+            for( i = 0; i < 8; i++ )
+            {
+                buf[ 17 + i ] = hx[ ( tcb >> ( 28 - 4 * i ) ) & 0xFU ];
+            }
+            for( i = 0; i < 8; i++ )
+            {
+                buf[ 30 + i ] = hx[ ( v >> ( 28 - 4 * i ) ) & 0xFU ];
+            }
+            SEGGER_RTT_WriteString( 0, buf );
+        }
+        else if( ( tick & 0x3FU ) == 0U )
+        {
+            extern unsigned SEGGER_RTT_WriteString( unsigned, const char * );
+            char buf[ 15 ] = "[smp] pc=........\r\n";
+
+            for( i = 0; i < 8; i++ )
+            {
+                buf[ 9 + i ] = hx[ ( v >> ( 28 - 4 * i ) ) & 0xFU ];
+            }
+            SEGGER_RTT_WriteString( 0, buf );
+        }
+    }
+
     GET_INT_SP();
     portDISABLE_INTERRUPTS();
     SysTick->SR=0;

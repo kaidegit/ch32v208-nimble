@@ -173,3 +173,9 @@
 #define MYNEWT_VAL_SELFTEST (0)                  /* ble_hs.c / ble_sm_alg.c test hooks */
 
 #endif /* H_SYSCFG_OVERRIDES_WCH_ */
+
+/* Bring-up A/B test: set 1 to boot with the BLE IP unclocked (radio
+ * bring-up skipped entirely).  Used to bisect the async tick-54 crash. */
+#ifndef WCH_HW_SKIP_RADIO
+#define WCH_HW_SKIP_RADIO 1
+#endif

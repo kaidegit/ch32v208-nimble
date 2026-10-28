@@ -22,21 +22,21 @@ _start:
 _vector_base:
     .option norvc;
     .word   _start
-    .word   0
+    .word   wch_exc_trap               /* exc 1 - was 0: any fault here jumped to 0 */
     .word   NMI_Handler                /* NMI */
     .word   HardFault_Handler          /* Hard Fault */
-    .word   0
+    .word   wch_exc_trap               /* exc 4: load/store access fault -> mepc captured */
     .word   Ecall_M_Mode_Handler       /* Ecall M Mode */
-    .word   0
-    .word   0
+    .word   wch_exc_trap               /* exc 6 */
+    .word   wch_exc_trap               /* exc 7 */
     .word   Ecall_U_Mode_Handler       /* Ecall U Mode */
     .word   Break_Point_Handler        /* Break Point */
-    .word   0
-    .word   0
+    .word   wch_exc_trap               /* exc 10 */
+    .word   wch_exc_trap               /* exc 11 */
     .word   SysTick_Handler            /* SysTick */
-    .word   0
+    .word   wch_exc_trap               /* exc 13 */
     .word   SW_Handler                 /* SW */
-    .word   0
+    .word   wch_exc_trap               /* exc 15 */
     /* External Interrupts */
     .word   WWDG_IRQHandler            /* Window Watchdog */
     .word   PVD_IRQHandler             /* PVD through EXTI Line detect */
@@ -219,7 +219,44 @@ DMA1_Channel8_IRQHandler:
 OSC32KCal_IRQHandler:
 OSCWakeUp_IRQHandler:
 1:
-	j 1b
+	/* Forensic trap shared by all unused-vector stubs: stash the machine
+	 * state into fixed RAM (survives a wild sp - printf may not work) and
+	 * park.  jal sets ra to the address INSIDE this shim's caller region,
+	 * identifying which vector landed.  Read g_stub_trap_words via gdb. */
+	csrr t0, mcause
+	csrr t1, mepc
+	csrr t2, mtval
+	la   t3, g_stub_trap_words
+	sw   t0, 0(t3)
+	sw   t1, 4(t3)
+	sw   t2, 8(t3)
+	sw   ra, 12(t3)
+	mv   t0, sp
+	sw   t0, 16(t3)
+	mv   t0, gp
+	sw   t0, 20(t3)
+	tail wch_stub_trap_report
+2:	j 2b
+
+/* Raw exception trap for the reserved exception slots: stash mcause/
+ * mepc/mtval/sp/gp into g_exc_trap_words (fixed RAM) and spin.  No C
+ * calls - sp may be wild.  Read g_exc_trap_words via gdb: mepc is the
+ * address of the faulting instruction. */
+	.section	.text.vector_handler, "ax", @progbits
+	.globl	wch_exc_trap
+wch_exc_trap:
+	csrr t0, mcause
+	csrr t1, mepc
+	csrr t2, mtval
+	mv   t4, sp
+	la   t3, g_exc_trap_words
+	sw   t0, 0(t3)
+	sw   t1, 4(t3)
+	sw   t2, 8(t3)
+	sw   t4, 12(t3)
+	mv   t0, gp
+	sw   t0, 16(t3)
+1:	j 1b
 
 	.section	.text.handle_reset,"ax",@progbits
 	.weak	handle_reset
@@ -256,14 +293,14 @@ handle_reset:
 /* Configure pipelining and instruction prediction */
     li t0, 0x1f
     csrw 0xbc0, t0
-/* INTSYSCR(0x804): bit1 INESTEN=1 keeps interrupt nesting, bit0 HWSTKEN=0
- * DISABLES the HPE hardware prologue.  The EVT default was 0x3 (HPE on).
- * The FreeRTOS port in third_party/freertos moves sp/mscratch in software
- * across context switches (SW_Handler, xPortStartFirstTask) and every
- * handler here is a plain interrupt() function that saves its own
- * registers, so HPE push/pop is redundant - and was the prime suspect for
- * the deterministic RAM corruption seen during bring-up.  Keep OFF. */
-	li t0, 0x2
+/* INTSYSCR(0x804): 0x0 = interrupt nesting OFF + HPE hardware prologue
+ * OFF.  The EVT default was 0x3 (both on).  Bring-up forensics found the
+ * 2 KB ISR stack overflowing once multiple IRQ levels nested on the
+ * mscratch-swapped ISR stack, spraying register frames into adjacent RAM
+ * (heap/kernel-variable corruption - the entire "async writer" saga).
+ * The FreeRTOS port serializes handlers fine without nesting (every
+ * handler saves its own registers), so both features stay off. */
+	li t0, 0x0
 	csrw 0x804, t0
 /* Enable global interrupt and configure privileged mode */
     li t0, 0x1888

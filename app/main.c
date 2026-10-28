@@ -51,6 +51,21 @@ static StackType_t xIdleTaskStack[ configMINIMAL_STACK_SIZE ];
 static StaticTask_t xTimerTaskTCB;
 static StackType_t xTimerTaskStack[ configTIMER_TASK_STACK_DEPTH ];
 
+/* Bring-up forensics: the SysTick sampler (port.c) validates pxCurrentTCB
+ * against these three addresses; the sprayer manifests as pxCurrentTCB
+ * pointing somewhere else entirely. */
+const void * const g_tcb_addrs[ 3 ] =
+{
+    &xIdleTaskTCB, &xAppTaskTCB, &xTimerTaskTCB
+};
+
+/* Bring-up forensics: called by tasks.c before each stack fill. */
+void prv_dbg_fill_log( void * dst, uint32_t size )
+{
+    SEGGER_RTT_printf( 0, "fill: dst=%08x size=%u\r\n",
+                       ( unsigned ) ( uintptr_t ) dst, ( unsigned ) size );
+}
+
 void vApplicationGetIdleTaskMemory( StaticTask_t ** ppxIdleTaskTCBBuffer,
                                     StackType_t ** ppxIdleTaskStackBuffer,
                                     uint32_t * pulIdleTaskStackSize )
@@ -281,6 +296,26 @@ int main( void )
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7E8UL,
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7ECUL,
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7F0UL );
+
+    /* Bring-up forensics: varargs battery.  The silent deaths all landed on
+     * the FIRST argument-carrying console_printf (vsnprintf %p path) and
+     * once on SEGGER_RTT_printf (%x) from an ISR - print each primitive in
+     * isolation with a breadcrumb before it. */
+    SEGGER_RTT_WriteString( 0, "vat: segger-x\n" );
+    SEGGER_RTT_printf( 0, "vat: segger %08x done\r\n", 0xDEADBEEFUL );
+    {
+        char tbuf[ 64 ];
+
+        SEGGER_RTT_WriteString( 0, "vat: vsnprintf-d\n" );
+        ( void ) snprintf( tbuf, sizeof( tbuf ), "vat: d=%d done\n", 42 );
+        SEGGER_RTT_WriteString( 0, tbuf );
+        SEGGER_RTT_WriteString( 0, "vat: vsnprintf-x\n" );
+        ( void ) snprintf( tbuf, sizeof( tbuf ), "vat: x=%08x done\n", 0xCAFEBABEUL );
+        SEGGER_RTT_WriteString( 0, tbuf );
+        SEGGER_RTT_WriteString( 0, "vat: vsnprintf-p\n" );
+        ( void ) snprintf( tbuf, sizeof( tbuf ), "vat: p=%p done\n", ( void * ) 0x12345678UL );
+        SEGGER_RTT_WriteString( 0, tbuf );
+    }
 
     /* Option-byte repair, only if the partition actually deviates.
      * RAM_CODE_MOD (OBR[9:7]) is a bit PATTERN, not an enum: 00x (values

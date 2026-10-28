@@ -847,6 +847,14 @@ static void prvInitialiseNewTask( TaskFunction_t pxTaskCode,
     #if ( tskSET_NEW_STACKS_TO_KNOWN_VALUE == 1 )
         {
             /* Fill the stack with a known value to assist debugging. */
+            /* Bring-up forensics: log dst/size - the observed A5 wipe overran
+             * every stack into kernel variables; verify the runtime size. */
+            {
+                extern unsigned SEGGER_RTT_WriteString( unsigned, const char * );
+                extern void prv_dbg_fill_log( void * dst, uint32_t size );
+                prv_dbg_fill_log( pxNewTCB->pxStack,
+                                  ( uint32_t ) ( ulStackDepth * sizeof( StackType_t ) ) );
+            }
             ( void ) memset( pxNewTCB->pxStack, ( int ) tskSTACK_FILL_BYTE, ( size_t ) ulStackDepth * sizeof( StackType_t ) );
         }
     #endif /* tskSET_NEW_STACKS_TO_KNOWN_VALUE */

@@ -45,6 +45,7 @@
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
 #include "nimble/transport.h"
+#include "nimble/hci_common.h"
 #if NIMBLE_CFG_CONTROLLER
 #include "controller/ble_ll.h"
 #include "os/os_cputime.h"
@@ -56,6 +57,19 @@ extern void wch_ble_hw_init(void);
 
 /* Bring-up forensics: step-localizing tripwire checker (app/main.c). */
 extern void app_dbg_chk(const char *tag);
+
+/* Program a QingKe trigger-module store watchpoint on 'addr'.  Any store
+ * to it raises a breakpoint exception (HardFault), whose mepc names the
+ * writing instruction.  Used on pool_evt's block-size word: written once
+ * by os_mempool_init, never again by legitimate code. */
+void wch_watch_store(uint32_t addr)
+{
+    /* tselect=0x7a0, tdata1=0x7a1, tdata2=0x7a2 (RV32 trigger module) */
+    __asm__ volatile ("csrw 0x7a0, zero");            /* trigger 0 */
+    /* mcontrol: type=2, M=1, store=1, load=0, action=0 (exception) */
+    __asm__ volatile ("li t0, 0x20000042; csrw 0x7a1, t0" ::: "t0");
+    __asm__ volatile ("csrw 0x7a2, %0" :: "r" (addr));
+}
 
 static struct ble_npl_eventq g_eventq_dflt;
 
@@ -255,6 +269,18 @@ nimble_port_init(void)
     console_printf("np:6 transport\n");
     /* 6. HCI buffer pools */
     ble_transport_init();
+    app_dbg_chk("np:6");
+
+    /* Bring-up forensics: watch the first word of the (unused) whitelist
+     * canary - nothing writes it legitimately during bring-up.  Any store
+     * to it raises a breakpoint exception whose mepc names the writer. */
+    {
+        extern void wch_watch_store(uint32_t);
+        extern uint32_t g_wch_whitelist[];
+        wch_watch_store((uint32_t) &g_wch_whitelist[0]);
+        console_printf("np:6w watch armed @%08x\n",
+                       (unsigned) (uintptr_t) &g_wch_whitelist[0]);
+    }
 
     console_printf("np:7 hs\n");
     /* 7. host side of the transport */
@@ -262,8 +288,35 @@ nimble_port_init(void)
 
 #if NIMBLE_CFG_CONTROLLER
     console_printf("np:8 ll-tr\n");
-    /* 8. controller side of the transport */
-    ble_transport_ll_init();
+    /* 8. controller side of the transport.  ble_transport_ll_init() is just
+     * ble_ll_hci_send_noop(): alloc evt, fill, send to host.  Open-coded
+     * with breadcrumbs because the silent death lands inside it. */
+    {
+        extern void *ble_transport_alloc_evt(int);
+        extern void ble_transport_free(void *);
+        void *probe = ble_transport_alloc_evt(0);
+        console_printf("np:8a alloc=%p\n", probe);
+        if (probe) {
+            ble_transport_free(probe);
+        }
+    }
+    {
+        extern void *ble_transport_alloc_evt(int);
+        struct ble_hci_ev *hci_ev = ble_transport_alloc_evt(0);
+        console_printf("np:8b ev=%p\n", (void *)hci_ev);
+        if (hci_ev != NULL) {
+            struct ble_hci_ev_command_complete_nop *ev;
+
+            hci_ev->opcode = BLE_HCI_EVCODE_COMMAND_COMPLETE;
+            hci_ev->length = sizeof(*ev);
+            ev = (void *)hci_ev->data;
+            ev->num_packets = 1;
+            ev->opcode = BLE_HCI_OPCODE_NOP;
+            console_printf("np:8c filled\n");
+            ble_transport_to_hs_evt(hci_ev);
+            console_printf("np:8d sent\n");
+        }
+    }
 #endif
 
     console_printf("np: done\n");

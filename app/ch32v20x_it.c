@@ -49,10 +49,47 @@ void TIM3_IRQHandler( void ) __attribute__( ( interrupt ) );
 void BB_IRQHandler( void ) __attribute__( ( interrupt ) );
 void LLE_IRQHandler( void ) __attribute__( ( interrupt ) );
 
+/* Bring-up forensics: nothing in this project enables the WWDG, yet the
+ * core was found parked in its weak spin stub.  A strong handler turns
+ * the silent spin into a full report: mcause bit31+code16 proves a real
+ * WWDG interrupt (vs. a wild jump into the stub), and the PFIC status
+ * words show which interrupt lines are asserted/active. */
+void WWDG_IRQHandler( void ) __attribute__( ( interrupt ) );
+
 /* Weak callees: real implementations arrive with the wch_ble library. */
 extern void hal_timer_wch_irq( void ) __attribute__( ( weak ) );
 extern void wch_rf_bb_isr( void ) __attribute__( ( weak ) );
 extern void wch_rf_lle_isr( void ) __attribute__( ( weak ) );
+
+/*********************************************************************
+ * Shared reporter for the startup's unused-vector stubs.  The .S shim
+ * stashes mcause/mepc/mtval + entry ra into g_stub_trap_words FIRST
+ * (fixed RAM - survives a wild sp), then this best-effort print runs
+ * and the core parks.  Read g_stub_trap_words via gdb when the print
+ * did not make it out.
+ *********************************************************************/
+volatile uint32_t g_stub_trap_words[ 8 ];
+volatile uint32_t g_exc_trap_words[ 8 ];    /* written by wch_exc_trap (.S) */
+volatile uint32_t g_config_assert_line;
+
+void wch_stub_trap_report( uint32_t mcause, uint32_t mepc, uint32_t mtval )
+{
+    g_stub_trap_words[ 0 ] = mcause;
+    g_stub_trap_words[ 1 ] = mepc;
+    g_stub_trap_words[ 2 ] = mtval;
+    g_stub_trap_words[ 3 ] = PFIC->IACTR[ 0 ];
+    g_stub_trap_words[ 4 ] = PFIC->IACTR[ 1 ];
+    g_stub_trap_words[ 5 ] = PFIC->GISR;
+
+    SEGGER_RTT_printf( 0, "\r\n[STUB-TRAP] mcause=%08x mepc=%08x mtval=%08x\r\n",
+                       mcause, mepc, mtval );
+    SEGGER_RTT_printf( 0, "[STUB-TRAP] iactr=%08x %08x %08x gisr=%08x\r\n",
+                       g_stub_trap_words[ 3 ], g_stub_trap_words[ 4 ],
+                       g_stub_trap_words[ 5 ], PFIC->GISR );
+    for( ;; )
+    {
+    }
+}
 
 /*********************************************************************
  * NMI_Handler
@@ -107,6 +144,29 @@ void TIM3_IRQHandler( void )
     if( hal_timer_wch_irq )
     {
         hal_timer_wch_irq();
+    }
+}
+
+/*********************************************************************
+ * WWDG: never enabled by this project - report and park.
+ *********************************************************************/
+void WWDG_IRQHandler( void )
+{
+    uint32_t mcause, mepc, mtval;
+
+    __asm volatile( "csrr %0, mcause" : "=r"( mcause ) );
+    __asm volatile( "csrr %0, mepc"   : "=r"( mepc ) );
+    __asm volatile( "csrr %0, mtval"  : "=r"( mtval ) );
+
+    SEGGER_RTT_printf( 0, "\r\n[WWDG] mcause=%08x mepc=%08x mtval=%08x\r\n",
+                       mcause, mepc, mtval );
+    SEGGER_RTT_printf( 0, "[WWDG] isr=%08x %08x %08x\r\n",
+                       PFIC->ISR[ 0 ], PFIC->ISR[ 1 ], PFIC->ISR[ 2 ] );
+    SEGGER_RTT_printf( 0, "[WWDG] iactr=%08x %08x %08x gisr=%08x cfgr=%08x\r\n",
+                       PFIC->IACTR[ 0 ], PFIC->IACTR[ 1 ], PFIC->IACTR[ 2 ],
+                       PFIC->GISR, PFIC->CFGR );
+    for( ;; )
+    {
     }
 }
 

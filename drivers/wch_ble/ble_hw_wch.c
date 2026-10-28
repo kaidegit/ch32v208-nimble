@@ -438,6 +438,9 @@ wch_ble_hw_init(void)
     console_printf("hw: adc=%u ok=%d\r\n", temp, adc_ok);
     app_dbg_chk("hw:adc");
 
+#if WCH_HW_SKIP_RADIO   /* bring-up A/B test: BLE IP clocked off */
+    console_printf("hw: rf_init SKIPPED (A/B test)\n");
+#else
     console_printf("hw: rf_init\n");
     (void)wch_rf_init();
     app_dbg_chk("hw:rf");
@@ -445,6 +448,7 @@ wch_ble_hw_init(void)
     console_printf("hw: phy_init\n");
     (void)ble_phy_init();
     app_dbg_chk("hw:phy");
+#endif
 
     console_printf("hw: rng_seed\n");
     /* Seed the (weak) software RNG once at boot - the ADC sample is

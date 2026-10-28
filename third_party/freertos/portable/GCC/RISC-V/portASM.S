@@ -164,8 +164,28 @@ SW_Handler:
 
 processed_source:
 	load_x  t1, pxCurrentTCB			/* Load pxCurrentTCB. */
+	/* Bring-up forensics: validate the TCB pointer and its saved sp before
+	 * restoring - the crash manifests as a context switch restoring from a
+	 * NULL/zeroed pxTopOfStack (sp=0 -> the core ends up executing garbage).
+	 * Stash the offending values into g_stub_trap_words and park. */
+	beqz    t1, sw_trap_bad
 	load_x  sp, 0( t1 )				 	/* Read sp from first TCB member. */
-
+	beqz    sp, sw_trap_bad
+	li      t2, 0x20000000
+	bltu    sp, t2, sw_trap_bad
+	li      t2, 0x20010000
+	bgeu    sp, t2, sw_trap_bad
+	j       sw_restore_ok
+sw_trap_bad:
+	la      t3, g_stub_trap_words
+	sw      t1, 0( t3 )                 /* the bad pxCurrentTCB value   */
+	sw      sp, 4( t3 )                 /* the bad pxTopOfStack value  */
+	csrr    t0, mcause
+	sw      t0, 8( t3 )
+	mv      t0, gp
+	sw      t0, 12( t3 )
+1:	j       1b
+sw_restore_ok:
 	/* Load mret with the address of the next instruction in the task to run next. */
 	load_x t0, 0( sp )
 	csrw mepc, t0
