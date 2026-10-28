@@ -1,0 +1,11 @@
+build*/
+*.swp
+.DS_Store
+
+# build artifacts (appended)
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+*.map
