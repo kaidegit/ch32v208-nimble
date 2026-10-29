@@ -71,22 +71,20 @@ extern void ble_ll_init(void);
 bool
 npl_wch_in_isr(void)
 {
-    uint32_t mcause;
-
-    __asm__ volatile ("csrr %0, mcause" : "=r" (mcause));
-    /* Interrupt traps set the MSB of mcause on RV32. */
-    return (mcause & 0x80000000u) != 0;
+    /* mcause describes the most recent trap and remains set after mret.
+     * PFIC_GISR.GACTSTA (QingKe V4 manual, bit 8) reports a live ISR. */
+    return (*(volatile const uint32_t *)0xE000E04CUL & (1UL << 8)) != 0;
 }
 
 struct ble_npl_event *
 npl_wch_eventq_get(struct ble_npl_eventq *evq, ble_npl_time_t tmo)
 {
     struct ble_npl_event *ev = NULL;
-    BaseType_t woken;
+    BaseType_t woken = pdFALSE;
     BaseType_t ret;
 
     if (npl_wch_in_isr()) {
-        assert(tmo == 0);
+        configASSERT(tmo == 0);
         ret = xQueueReceiveFromISR(evq->q, &ev, &woken);
         portYIELD_FROM_ISR(woken);
         assert(ret == pdPASS || ret == errQUEUE_EMPTY);
@@ -103,7 +101,7 @@ npl_wch_eventq_get(struct ble_npl_eventq *evq, ble_npl_time_t tmo)
 void
 npl_wch_eventq_put(struct ble_npl_eventq *evq, struct ble_npl_event *ev)
 {
-    BaseType_t woken;
+    BaseType_t woken = pdFALSE;
 
     if (ev->queued) {
         return;
@@ -123,7 +121,7 @@ npl_wch_eventq_remove(struct ble_npl_eventq *evq, struct ble_npl_event *ev)
 {
     struct ble_npl_event *tmp_ev;
     BaseType_t woken = pdFALSE;
-    BaseType_t woken2;
+    BaseType_t woken2 = pdFALSE;
     BaseType_t ret;
     int i;
     int count;
@@ -162,11 +160,11 @@ npl_wch_eventq_remove(struct ble_npl_eventq *evq, struct ble_npl_event *ev)
 ble_npl_error_t
 npl_wch_sem_pend(struct ble_npl_sem *sem, ble_npl_time_t timeout)
 {
-    BaseType_t woken;
+    BaseType_t woken = pdFALSE;
     BaseType_t ret;
 
     if (npl_wch_in_isr()) {
-        assert(timeout == 0);
+        configASSERT(timeout == 0);
         ret = xSemaphoreTakeFromISR(sem->handle, &woken);
         portYIELD_FROM_ISR(woken);
         return ret == pdPASS ? BLE_NPL_OK : BLE_NPL_TIMEOUT;
@@ -178,7 +176,7 @@ npl_wch_sem_pend(struct ble_npl_sem *sem, ble_npl_time_t timeout)
 ble_npl_error_t
 npl_wch_sem_release(struct ble_npl_sem *sem)
 {
-    BaseType_t woken;
+    BaseType_t woken = pdFALSE;
 
     if (npl_wch_in_isr()) {
         (void)xSemaphoreGiveFromISR(sem->handle, &woken);
@@ -192,7 +190,7 @@ npl_wch_sem_release(struct ble_npl_sem *sem)
 ble_npl_error_t
 npl_wch_callout_reset(struct ble_npl_callout *co, ble_npl_time_t ticks)
 {
-    BaseType_t woken1, woken2, woken3;
+    BaseType_t woken1 = pdFALSE, woken2 = pdFALSE, woken3 = pdFALSE;
 
     if (ticks == 0) {
         ticks = 1;
@@ -218,12 +216,6 @@ extern void os_mempool_module_init(void);
 #if NIMBLE_CFG_CONTROLLER
 extern void ble_ll_init(void);
 #endif
-
-/* RAM word backing the compile-only SCB shim (config/npl_wch_scb.h).  It
- * never becomes non-zero; real ISR detection lives in npl_wch_in_isr(). */
-volatile uint32_t g_npl_wch_scb_shim;
-
-
 
 /* ----------------------------------------------------- nimble_port API */
 
@@ -270,52 +262,14 @@ nimble_port_init(void)
     ble_transport_init();
     app_dbg_chk("np:6");
 
-    /* Bring-up forensics: watch the first word of the (unused) whitelist
-     * canary - nothing writes it legitimately during bring-up.  Any store
-     * to it raises a breakpoint exception whose mepc names the writer. */
-    {
-        extern void wch_watch_store(uint32_t);
-        extern uint32_t g_wch_whitelist[];
-        wch_watch_store((uint32_t) &g_wch_whitelist[0]);
-        console_printf("np:6w watch armed @%08x\n",
-                       (unsigned) (uintptr_t) &g_wch_whitelist[0]);
-    }
-
     console_printf("np:7 hs\n");
     /* 7. host side of the transport */
     ble_transport_hs_init();
 
 #if NIMBLE_CFG_CONTROLLER
     console_printf("np:8 ll-tr\n");
-    /* 8. controller side of the transport.  ble_transport_ll_init() is just
-     * ble_ll_hci_send_noop(): alloc evt, fill, send to host.  Open-coded
-     * with breadcrumbs because the silent death lands inside it. */
-    {
-        extern void *ble_transport_alloc_evt(int);
-        extern void ble_transport_free(void *);
-        void *probe = ble_transport_alloc_evt(0);
-        console_printf("np:8a alloc=%p\n", probe);
-        if (probe) {
-            ble_transport_free(probe);
-        }
-    }
-    {
-        extern void *ble_transport_alloc_evt(int);
-        struct ble_hci_ev *hci_ev = ble_transport_alloc_evt(0);
-        console_printf("np:8b ev=%p\n", (void *)hci_ev);
-        if (hci_ev != NULL) {
-            struct ble_hci_ev_command_complete_nop *ev;
-
-            hci_ev->opcode = BLE_HCI_EVCODE_COMMAND_COMPLETE;
-            hci_ev->length = sizeof(*ev);
-            ev = (void *)hci_ev->data;
-            ev->num_packets = 1;
-            ev->opcode = BLE_HCI_OPCODE_NOP;
-            console_printf("np:8c filled\n");
-            ble_transport_to_hs_evt(hci_ev);
-            console_printf("np:8d sent\n");
-        }
-    }
+    /* 8. controller side: send the initial command-credit NOP. */
+    ble_transport_ll_init();
 #endif
 
     console_printf("np: done\n");

@@ -2,7 +2,7 @@
  * main.c - CH32V208 NimBLE bring-up entry.
  *
  * Called from handle_reset (startup_ch32v20x_D8W.S) after SystemInit()
- * and in machine mode with global interrupts enabled (mstatus = 0x1888).
+ * and in machine mode with interrupts masked until the scheduler starts.
  *
  * Responsibilities:
  *  - refresh SystemCoreClock, init SEGGER RTT and print the boot banner
@@ -16,14 +16,12 @@
  */
 
 #include <stdint.h>
-#include <stdio.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
 
 #include "SEGGER_RTT.h"
 #include "ch32v20x.h"
-#include "ch32v20x_flash.h"
 
 /* Linker-provided boundaries (ld/Link.ld). */
 extern char _heap_start[];
@@ -57,6 +55,7 @@ static StackType_t xTimerTaskStack[ configTIMER_TASK_STACK_DEPTH ];
  * pins the exact call site the bomb hit from. */
 volatile uint32_t g_trace_ring[ 3 * 128 ];
 volatile uint32_t g_trace_wr;
+volatile uint32_t g_tick_sample_pc;
 
 void app_trace( uint32_t tag, void * ra )
 {
@@ -68,21 +67,6 @@ void app_trace( uint32_t tag, void * ra )
 }
 
 #define TRACE( n )  app_trace( ( n ), __builtin_return_address( 0 ) )
-
-/* Bring-up forensics: the SysTick sampler (port.c) validates pxCurrentTCB
- * against these three addresses; the sprayer manifests as pxCurrentTCB
- * pointing somewhere else entirely. */
-const void * const g_tcb_addrs[ 3 ] =
-{
-    &xIdleTaskTCB, &xAppTaskTCB, &xTimerTaskTCB
-};
-
-/* Bring-up forensics: called by tasks.c before each stack fill. */
-void prv_dbg_fill_log( void * dst, uint32_t size )
-{
-    SEGGER_RTT_printf( 0, "fill: dst=%08x size=%u\r\n",
-                       ( unsigned ) ( uintptr_t ) dst, ( unsigned ) size );
-}
 
 void vApplicationGetIdleTaskMemory( StaticTask_t ** ppxIdleTaskTCBBuffer,
                                     StackType_t ** ppxIdleTaskStackBuffer,
@@ -220,14 +204,11 @@ void app_dbg_chk( const char * tag )
         }
     }
 
-    SEGGER_RTT_printf( 0, "chk[%s]: tcb=%08x%s wl=%d rtt=%d z=%d%d\r\n",
-                       tag, ( unsigned ) tcb,
-                       ( tcb == ( uint32_t ) &xAppTaskTCB ) ? "" : "!",
-                       wl_bad, rtt_bad, zlo_bad, zhi_bad );
-
     if( ( tcb != ( uint32_t ) &xAppTaskTCB ) || wl_bad || rtt_bad ||
         zlo_bad || zhi_bad )
     {
+        SEGGER_RTT_printf( 0, "chk[%s]: tcb=%08x wl=%d rtt=%d z=%d%d\r\n",
+                           tag, (unsigned)tcb, wl_bad, rtt_bad, zlo_bad, zhi_bad );
         volatile uint32_t * p = slot - 12;
 
         for( i = 0; i < 6; i++, p += 4 )
@@ -269,54 +250,6 @@ static void app_task( void * pvParameters )
     }
 }
 
-    /* Bring-up forensics: trigger-module store watchpoint helpers (used by
- * main.c and the npl port; must live in a file both targets link). */
-/* Program a QingKe trigger-module store watchpoint on 'addr'.  Any store
- * to it raises a breakpoint exception (HardFault), whose mepc names the
- * writing instruction.  Used on pool_evt's block-size word: written once
- * by os_mempool_init, never again by legitimate code. */
-void wch_watch_store(uint32_t addr)
-{
-    /* tselect=0x7a0, tdata1=0x7a1, tdata2=0x7a2 (RV32 trigger module) */
-    __asm__ volatile ("csrw 0x7a0, zero");            /* trigger 0 */
-    /* mcontrol: type=2, M=1, store=1, load=0, action=0 (exception) */
-    __asm__ volatile ("li t0, 0x20000042; csrw 0x7a1, t0" ::: "t0");
-    __asm__ volatile ("csrw 0x7a2, %0" :: "r" (addr));
-}
-
-/* Execute-breakpoint at addr: fires when the PC matches.  With action=0
- * this raises a breakpoint exception (vector slot 3 -> wch_exc_trap). */
-void wch_watch_exec(uint32_t addr)
-{
-    /* mcontrol (type 2): EXECUTE = bit2, M = bit5, action 0 (exception) */
-    __asm__ volatile ("csrw 0x7a0, zero");
-    __asm__ volatile ("li t0, 0x24; csrw 0x7a1, t0" ::: "t0");
-    __asm__ volatile ("csrw 0x7a2, %0" :: "r" (addr));
-}
-
-/* Calibration: does the trigger module exist and hold writes?  Prints
- * tinfo and a write/readback of tdata1 with a disabled type. */
-void wch_watch_probe(void)
-{
-    uint32_t info = 0, rb = 0, sel = 0;
-
-    __asm__ volatile ("csrr %0, 0x7a4" : "=r" (info));
-    __asm__ volatile ("csrw 0x7a0, zero");
-    __asm__ volatile ("li t0, 0x60000000; csrw 0x7a1, t0" ::: "t0");
-    __asm__ volatile ("csrr %0, 0x7a1" : "=r" (rb));
-    __asm__ volatile ("csrr %0, 0x7a0" : "=r" (sel));
-    SEGGER_RTT_printf( 0, "trg: tinfo=%08x sel=%08x tdata1rb=%08x\r\n",
-                       ( unsigned ) info, ( unsigned ) sel, ( unsigned ) rb );
-}
-
-/* Bring-up forensics: executes from beyond the 128K zero-wait window. */
-__attribute__( ( section( ".farcode" ), noinline ) )
-int far_add( int a, int b )
-{
-    volatile int t = a * 3;
-    return t + b;
-}
-
 int main( void )
 {
     /* SystemInit() already ran from the reset handler; refresh the
@@ -346,7 +279,7 @@ int main( void )
                        ( unsigned ) ( ( *( volatile uint32_t * ) 0x4002201CUL >> 7 ) & 0x7UL ),
                        ( unsigned ) *( volatile uint16_t * ) 0x1FFFF7E0UL );
     /* INTSYSCR (CSR 0x804): confirm the startup's HPE/nesting configuration -
-     * startup_ch32v20x_D8W.S now writes 0x2 (nesting on, HPE off). */
+     * startup_ch32v20x_D8W.S writes 0 (nesting and HPE off). */
     {
         uint32_t intsyscr;
 
@@ -362,143 +295,6 @@ int main( void )
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7E8UL,
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7ECUL,
                        ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7F0UL );
-
-/* Bring-up forensics: trigger-module calibration + execute-breakpoint
-     * at PC=0x0.  When the phantom wild jump lands, slot-3 vectors into the
-     * raw exc trap which stashes ra = the culprit call site. */
-    {
-        extern void wch_watch_probe(void);
-        extern void wch_watch_exec(uint32_t);
-        wch_watch_probe();
-        /* The wild jump lands at PC=0 (then re-runs the CRT through the
-         * 0x0 alias).  An execute-trigger at 0 fires BEFORE any
-         * instruction there runs, so the trap stash captures the caller's
-         * ra intact - the null/garbage function pointer call site. */
-        wch_watch_exec( 0x0UL );
-        SEGGER_RTT_WriteString( 0, "trg: exec-watch @0 armed\r\n" );
-    }
-
-    /* Bring-up forensics: varargs battery.  The silent deaths all landed on
-     * the FIRST argument-carrying console_printf (vsnprintf %p path) and
-     * once on SEGGER_RTT_printf (%x) from an ISR - print each primitive in
-     * isolation with a breadcrumb before it. */
-    SEGGER_RTT_WriteString( 0, "vat: segger-x\n" );
-    SEGGER_RTT_printf( 0, "vat: segger %08x done\r\n", 0xDEADBEEFUL );
-    {
-        char tbuf[ 64 ];
-
-        SEGGER_RTT_WriteString( 0, "vat: vsnprintf-d\n" );
-        ( void ) snprintf( tbuf, sizeof( tbuf ), "vat: d=%d done\n", 42 );
-        SEGGER_RTT_WriteString( 0, tbuf );
-        SEGGER_RTT_WriteString( 0, "vat: vsnprintf-x\n" );
-        ( void ) snprintf( tbuf, sizeof( tbuf ), "vat: x=%08x done\n", 0xCAFEBABEUL );
-        SEGGER_RTT_WriteString( 0, tbuf );
-        SEGGER_RTT_WriteString( 0, "vat: vsnprintf-p\n" );
-        ( void ) snprintf( tbuf, sizeof( tbuf ), "vat: p=%p done\n", ( void * ) 0x12345678UL );
-        SEGGER_RTT_WriteString( 0, tbuf );
-    }
-
-    /* Option-byte repair, only if the partition actually deviates.
-     * RAM_CODE_MOD (OBR[9:7]) is a bit PATTERN, not an enum: 00x (values
-     * 0-1) = CODE-128K + RAM-64K (factory default - value 1 is the SAME
-     * partition as 0!), 01x (2-3) = 144K+48K, 1xx (4-7) = 160K+32K.
-     * Mode 1 was initially misread as non-default and an unnecessary
-     * reprogram was attempted (and faulted mid-way) - hence the pattern
-     * test below and the RAM-valid scratch stack the repair runs on.
-     * ld/Link.ld requires the 00x family (64K SRAM). */
-    {
-        uint32_t mode = ( *( volatile uint32_t * ) 0x4002201CUL >> 7 ) & 0x7UL;
-
-        if( ( mode & 0x6UL ) != 0UL )
-        {
-            /* Valid RAM top for the CURRENT mode: 00x=64K, 01x=48K,
-             * 1xx=32K.  main() runs on the main stack at 0x2000F800+,
-             * which is nonexistent under a non-default mode; the SDK's
-             * FLASH_ProgramOptionByteData reads all option halfwords
-             * into a stack array and rewrites them - run it from a
-             * 4K scratch stack just below the valid top (inside the
-             * .heap NOLOAD region, unused before malloc). */
-            uint32_t ram_top = ( mode & 0x4UL ) ? 0x20008000UL
-                               : ( ( mode & 0x2UL ) ? 0x2000C000UL
-                                                    : 0x20010000UL );
-            uint8_t user = *( volatile uint8_t * ) 0x1FFFF802UL;
-            uint8_t new_user = ( uint8_t ) ( user & 0x1FU ); /* [7:5]=000 */
-            FLASH_Status st;
-
-            SEGGER_RTT_printf( 0,
-                               "memcfg  : RAM_CODE_MOD=%lu non-default, "
-                               "restoring 000 (USER %02x->%02x)\r\n",
-                               ( unsigned long ) mode, user, new_user );
-
-            __asm__ volatile ( "mv sp, %0" : : "r"( ram_top - 0x1000UL )
-                                                : "memory" );
-
-            FLASH_Unlock();
-            st = FLASH_ProgramOptionByteData( 0x1FFFF802UL, new_user );
-
-            if( ( st == FLASH_COMPLETE ) &&
-                ( ( *( volatile uint8_t * ) 0x1FFFF802UL & 0xE0U ) == 0U ) )
-            {
-                SEGGER_RTT_WriteString( 0,
-                    "memcfg  : option byte restored, rebooting\r\n" );
-            }
-            else
-            {
-                SEGGER_RTT_printf( 0,
-                    "memcfg  : repair FAILED st=%d user=%02x, "
-                    "fix option bytes with WCH tools\r\n",
-                    ( int ) st,
-                    ( unsigned ) *( volatile uint8_t * ) 0x1FFFF802UL );
-            }
-            NVIC_SystemReset();
-            for( ;; )
-            {
-            }
-        }
-    }
-
-    /* RM 32.3: code in the flash region BEYOND the zero-wait window
-     * (RAM_CODE_MOD 00x -> 128K) only executes correctly with the FLASH
-     * enhanced-read mode enabled.  The image is ~134K and grows; without
-     * EHMOD every fetch past 0x08020000 returned garbage - the wild jumps
-     * (mcause=0/mepc=0/ra=8/sp=0/gp=0x101) whose death site wandered
-     * between np:5/np:8/rng_seed as the layout shifted between builds.
-     * The WCH closed BLE lib enables this internally; the register-level
-     * driver must do it itself.  FLASH_CTLR(0x40022010).EHMOD = bit24;
-     * FLASH_STATR(0x4002200C).EHMODS = bit7 confirms.  NOTES: exit before
-     * any flash erase/program (option-byte repair above runs BEFORE this
-     * on purpose) and before stop mode; hardware auto-exits on reset.
-     * EHMOD is a "normal+fast unlock" bit: FLASH_CTLR comes up LOCKed
-     * (bit7=1) and silently ignores the write, so run the dual key
-     * sequence (FLASH_Unlock_Fast) first. */
-    {
-        uint32_t ctlr = *( volatile uint32_t * ) 0x40022010UL;
-
-        if( ( ctlr & 0x01000000UL ) == 0UL )
-        {
-            FLASH_Unlock_Fast();
-            *( volatile uint32_t * ) 0x40022010UL =
-                ( *( volatile uint32_t * ) 0x40022010UL ) | 0x01000000UL;
-        }
-        SEGGER_RTT_printf( 0, "ehmod   : CTLR=%08x EHMODS=%u\r\n",
-                           ( unsigned ) *( volatile uint32_t * ) 0x40022010UL,
-                           ( unsigned ) ( ( *( volatile uint32_t * ) 0x4002200CUL >> 7 ) & 1UL ) );
-
-        /* CPU data read beyond the CODE window: if this returns the real
-         * instruction bytes the data path works and only fetch is broken;
-         * 0xFFFFFFFF means the whole controller path is closed. */
-        {
-            uint32_t v = *( volatile uint32_t * ) 0x08021000UL;
-            SEGGER_RTT_printf( 0, "farpeek : %08x\r\n", ( unsigned ) v );
-        }
-    }
-
-    /* Out-of-window execution canary: far_add lives at 0x08020100. */
-    {
-        int r = far_add( 10, 20 );
-        SEGGER_RTT_printf( 0, "farcode : far_add(10,20)=%d %s\r\n", r,
-                           ( r == 50 ) ? "OK" : "WRONG" );
-    }
 
     SEGGER_RTT_WriteString( 0, "==============================\r\n" );
 

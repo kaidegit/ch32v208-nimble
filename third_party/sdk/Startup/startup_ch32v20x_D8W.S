@@ -235,6 +235,9 @@ OSCWakeUp_IRQHandler:
 	sw   t0, 16(t3)
 	mv   t0, gp
 	sw   t0, 20(t3)
+	lw   a0, 0(t3)
+	lw   a1, 4(t3)
+	lw   a2, 8(t3)
 	tail wch_stub_trap_report
 2:	j 2b
 
@@ -247,8 +250,9 @@ OSCWakeUp_IRQHandler:
 wch_exc_trap:
 	/* Full machine stash: g_exc_trap_words layout
 	 *  0 mcause  1 mepc   2 mtval  3 mstatus  4 mscratch
-	 *  5..36 x1..x31 (index = regnum+5; x0 skipped, it is 0)
-	 * 37 sp  38 gp  39 tp
+	 *  5..35 x1..x31 (index = regnum+4; x0 skipped)
+	 * t0/t1/t2/t3 are scratch registers clobbered by this shim;
+	 * their slots contain shim values, not interrupted values.
 	 * ra(x1) is the return address at trap time; the s-registers
 	 * (x8,x9,x18..x27) fingerprint the function that was executing. */
 	csrr t0, mcause
@@ -263,11 +267,11 @@ wch_exc_trap:
 	csrr t0, mscratch
 	sw   t0, 16(t3)
 	mv   t0, sp
-	sw   t0, 4*4+37*4(t3)
+	sw   t0, 4*4+2*4(t3)
 	mv   t0, gp
-	sw   t0, 4*4+38*4(t3)
+	sw   t0, 4*4+3*4(t3)
 	mv   t0, tp
-	sw   t0, 4*4+39*4(t3)
+	sw   t0, 4*4+4*4(t3)
 	sw   x1, 4*4+1*4(t3)
 	sw   x5, 4*4+5*4(t3)
 	sw   x6, 4*4+6*4(t3)
@@ -302,6 +306,13 @@ wch_exc_trap:
 	.weak	handle_reset
 	.align	1
 handle_reset:
+	/* Keep IRQs masked until the scheduler has valid task/ISR stacks.
+	 * Debugger restarts can leave SysTick/PFIC state from the last run. */
+	li t0, 0x1800
+	csrw mstatus, t0
+	li t0, 0xe000f000
+	sw zero, 0(t0)
+	sw zero, 4(t0)
 .option push 
 .option	norelax 
 	la gp, __global_pointer$
@@ -346,8 +357,8 @@ handle_reset:
  * handler saves its own registers), so both features stay off. */
 	li t0, 0x0
 	csrw 0x804, t0
-/* Enable global interrupt and configure privileged mode */
-    li t0, 0x1888
+/* Return to main with IRQs masked; xPortStartFirstTask enables them. */
+    li t0, 0x1800
    	csrw mstatus, t0
 /* Configure the interrupt vector table recognition mode and entry address mode */
  	la t0, _vector_base

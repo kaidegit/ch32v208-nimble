@@ -851,9 +851,7 @@ static void prvInitialiseNewTask( TaskFunction_t pxTaskCode,
              * every stack into kernel variables; verify the runtime size. */
             {
                 extern unsigned SEGGER_RTT_WriteString( unsigned, const char * );
-                extern void prv_dbg_fill_log( void * dst, uint32_t size );
-                prv_dbg_fill_log( pxNewTCB->pxStack,
-                                  ( uint32_t ) ( ulStackDepth * sizeof( StackType_t ) ) );
+
             }
             ( void ) memset( pxNewTCB->pxStack, ( int ) tskSTACK_FILL_BYTE, ( size_t ) ulStackDepth * sizeof( StackType_t ) );
         }

@@ -28,4 +28,4 @@ Add source dir lookup if needed:
     directory \$(pwd)
 EOF
 
-exec probe-rs gdb --chip "${CHIP}" --port 3333 "$@"
+exec probe-rs gdb --chip "${CHIP}" --gdb-connection-string localhost:3333 "$@"

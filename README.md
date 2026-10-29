@@ -1,5 +1,11 @@
 # ch32v208-nimble
 
+最新实机排查见 [2026-10-29 取证与修复记录](docs/bringup-2026-10-29.md)。已确认：
+`.farcode` 导致 CRT 的 `.data` 复制源错误；放在静态库中的 syscall overrides 未被链接；
+`mcause` 残留值把任务误判成 ISR，空事件回调又跳回 `_start`。当前已改为使用
+`LOADADDR(.data)`、直接链接 syscalls 和 `PFIC_GISR.GACTSTA`。
+下方调试历史中的 HPE/异步写内存/EHMOD 等旧推断应对照此记录阅读。
+
 **项目定位**：用 Apache NimBLE（controller + host 全开源）直接驱动 CH32V208 的蓝牙硬件，验证/测试该芯片的 BLE 功能。RF/BB/LLE 寄存器级驱动逆向自 WCH 闭源库 `libwchble.a`（见 [WCH_BLE_LIB_RE_FINDINGS.md](../../WCH_BLE_LIB_RE_FINDINGS.md)），**不用 WCH 闭源协议栈、不用 TMOS**。CMake 构建，FreeRTOS + NimBLE NPL(freertos)，probe-rs + WCH-LinkE + SEGGER RTT 日志。
 
 ## 架构

@@ -81,10 +81,9 @@ target_include_directories(freertos_kernel PUBLIC
 )
 
 # ------------------------------------------------------------ SEGGER RTT ---
-# (port/syscalls.c lives here: newlib syscall stubs writing to RTT,
-#  with malloc locking done through FreeRTOS headers)
+# System-call overrides are linked directly into the images below.
 file(GLOB RTT_SRC ${RTT_DIR}/*.c)
-add_library(segger_rtt STATIC ${RTT_SRC} port/syscalls.c)
+add_library(segger_rtt STATIC ${RTT_SRC})
 target_include_directories(segger_rtt PUBLIC
     ${RTT_DIR}
     ${FREERTOS_DIR}/include
@@ -154,6 +153,7 @@ set_source_files_properties(drivers/wch_ble/wch_rf.c
 
 # Full firmware: NimBLE host + controller over the WCH RF driver.
 add_executable(ch32v208_nimble
+    port/syscalls.c
     app/main.c
     app/app_ble.c
     app/ch32v20x_it.c
@@ -189,6 +189,7 @@ add_custom_command(TARGET ch32v208_nimble POST_BUILD
 # (main.c's app_ble_start() has a weak default; used to validate the
 #  toolchain/boot path before the BLE stack is linked in).
 add_executable(boot
+    port/syscalls.c
     app/main.c
     app/ch32v20x_it.c
     app/system_ch32v20x.c
@@ -202,3 +203,7 @@ target_link_options(boot PRIVATE
     -Wl,--gc-sections
     -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/boot.map
 )
+
+# Relink both images when the CRT memory layout changes.
+set_property(TARGET ch32v208_nimble boot APPEND PROPERTY LINK_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/ld/Link.ld)

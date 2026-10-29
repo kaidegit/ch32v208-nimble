@@ -26,15 +26,9 @@
  * Vendored verbatim from porting/npl/freertos/include/nimble/nimble_npl_os.h
  * @ master (1.9.0-dev) with these port changes:
  *
- * 1. ISR context: the stock npl_os_freertos.c in_isr() reads an ARM CMSIS
- *    SCB->ICSR word that this port pins to a constant-0 RAM word (see
- *    config/npl_wch_scb.h).  That is fine from task context but wrong from
- *    interrupt context, so every ISR-capable entry point below is routed
- *    through npl_wch_*() helpers (implemented in port/nimble_port_wch.c)
- *    that detect interrupts via the mcause CSR (bit 31 set) and call the
- *    FreeRTOS *FromISR() variants directly.  The stock npl_freertos_*()
- *    functions are then only ever called from task context, where their own
- *    (broken here) in_isr() check is harmless.
+ * 1. ISR-capable calls route through npl_wch_*() helpers using the live
+ *    PFIC_GISR.GACTSTA flag.  The stock NPL SCB shim uses the same flag.
+ *    mcause is unsuitable because its last-trap value survives mret.
  *    Routed: eventq_get/put/remove, sem_pend/release, callout_reset.
  * 2. Upstream bug fix: ble_npl_time_ticks_to_ms() recursed into itself;
  *    it now calls npl_freertos_time_ticks_to_ms().

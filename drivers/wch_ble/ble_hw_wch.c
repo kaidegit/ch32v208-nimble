@@ -468,9 +468,6 @@ wch_ble_hw_init(void)
     /* Seed the (weak) software RNG once at boot - the ADC sample is
      * taken above so the checker brackets it separately. */
     HW_TRACE(12);
-    console_printf("rng: uid=%08x %08x\r\n",
-                   *(volatile uint32_t *)0x1FFFF7E8UL,
-                   *(volatile uint32_t *)0x1FFFF7ECUL);
     HW_TRACE(13);
     ble_hw_rng_seed_with(temp);
     HW_TRACE(14);

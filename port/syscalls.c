@@ -26,6 +26,9 @@
 #undef errno
 extern int errno;
 
+int _kill( int pid, int sig );
+int _getpid( void );
+
 /* Heap boundaries from ld/Link.ld. */
 extern char _heap_start[];
 extern char _heap_end[];

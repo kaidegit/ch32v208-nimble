@@ -49,7 +49,7 @@ extern uint32_t SystemCoreClock;
 #define configMTIMECMP_BASE_ADDRESS     ( 0 )
 
 /* Statically allocated interrupt/ISR stack used by portASM.S
- * (xISRStackTop). 2 KB words = 8 KB is generous for BLE ISRs. */
+ * (xISRStackTop). Reserve 4 KB for interrupt handling. */
 #define configISR_STACK_SIZE_WORDS      ( 4096 / sizeof( StackType_t ) )
 
 #define configUSE_PREEMPTION            1
