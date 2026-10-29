@@ -30,8 +30,8 @@ echo
 echo "[run] flashing ${ELF}"
 probe-rs download --chip "${CHIP}" "$@" "${ELF}"
 
-# probe-rs 0.32 resets to 0x0 and then single-steps. The CH32V208 debug
-# interface cannot fetch through that alias; start through 0x08000000 instead.
+# Use the canonical Flash entry explicitly for reproducible debug starts.
+# Startup also handles reset through alias0 with an absolute trampoline.
 echo "[run] starting through 0x08000000; Ctrl-C detaches"
 exec probe-rs debug --chip "${CHIP}" "${ELF}" \
     -c break \

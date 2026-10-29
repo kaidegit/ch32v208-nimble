@@ -15,7 +15,14 @@
 	.global	_start
 	.align	1
 _start:
-	j	handle_reset
+    /* Flash is linked at 0x08000000 but reset can fetch through alias0.
+     * Canonicalize PC before any AUIPC-based RAM/Flash address calculation. */
+    .option push
+    .option norvc
+    .option norelax
+    lui t0, %hi(handle_reset)
+    jalr zero, %lo(handle_reset)(t0)
+    .option pop
 
     .section    .vector,"ax",@progbits
     .align  1

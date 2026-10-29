@@ -355,6 +355,7 @@ wch_rf_shut(void)
 
 /* Analog sequences live separately and use verified byte offsets. */
 extern int wch_rf_analog_init(void);
+extern void wch_rf_analog_dev_init(void);
 
 /* LLE_DevInit - RE §3.2 */
 static void
@@ -422,6 +423,7 @@ wch_rf_init(void)
     NVIC_DisableIRQ(BB_IRQn);
     NVIC_DisableIRQ(LLE_IRQn);
     lle_dev_init();
+    wch_rf_analog_dev_init();
     bb_dev_init();
     int rc = wch_rf_analog_init();
     if (rc != 0) {

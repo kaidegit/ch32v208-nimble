@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the two ELF/linker regressions found during CH32V208 bring-up.
+"""Check startup addressing, data loading and syscall linkage regressions.
 
 Usage: scripts/check-image.py build/ch32v208_nimble.elf [build/boot.elf]
 Uses only the Python standard library; expects the sibling .map file.
@@ -38,6 +38,23 @@ def check(path):
             symbols[cstr(names, name)] = value
 
     errors = []
+    init = named['.init']
+    if init[5] < 8:
+        errors.append('reset entry must use an absolute LUI/JALR trampoline')
+    else:
+        lui, jalr = struct.unpack_from('<II', data, init[4])
+        reg = (lui >> 7) & 31
+        imm = jalr >> 20
+        if imm & 0x800:
+            imm -= 0x1000
+        target = ((lui & 0xfffff000) + imm) & 0xfffffffe
+        if (lui & 0x7f != 0x37 or reg == 0 or
+                jalr & 0x707f != 0x67 or (jalr >> 7) & 31 != 0 or
+                (jalr >> 15) & 31 != reg or
+                target != symbols.get('handle_reset') or
+                symbols.get('_start') != init[3]):
+            errors.append('reset entry must jump absolutely to handle_reset from alias0')
+
     ram_data = named['.data']
     lmas = []
     for i in range(phnum):

@@ -8,7 +8,9 @@
 
 射频修正和空口实测另见 [射频复核记录](docs/radio-2026-10-29.md)。
 当前实测：55秒运行无异常/断言；Mac连续40秒扫描收到82条目标广播。
-连接/GATT仍在验证，尚不能声称通过。
+修正接收调度后，Mac连续三次连接均完成服务发现、uptime读取和echo写入/回读：
+64字节、空值和二进制值均通过，单次0.6–1.5秒。复位入口也已修复，可独立运行。
+尚未完成30分钟连接、2M和仪器级时序验证。
 macOS 测试客户端见 [tools/macos-ble](tools/macos-ble/README.md)。
 旧逆向笔记和下方历史表包含已推翻的寄存器解释，新增驱动修改必须核对原厂指令。
 
@@ -86,7 +88,7 @@ probe-rs debug --chip CH32V208WBU6 build/ch32v208_nimble.elf \
     -c break -c 'wreg sp 0x20010000' -c 'wreg pc 0x08000000' -c c
 ```
 
-**probe-rs 芯片名**：与 WCH-LinkE 目标封装对应——`CH32V208WBU6`（QFN48）、`CH32V208CBU6`（QFN32）、`CH32V208RBT6`（LQFP64）。任一脚本均可用 `CHIP=xxx scripts/xxx.sh` 覆盖，无需改代码。probe-rs 0.32 的通用 `run` 会从 `0x0` 复位并单步，而 CH32V208 调试接口不能经该别名取指，因此 `run.sh` 使用上述 `download + debug` 启动链路。
+**probe-rs 芯片名**：与 WCH-LinkE 目标封装对应——`CH32V208WBU6`（QFN48）、`CH32V208CBU6`（QFN32）、`CH32V208RBT6`（LQFP64）。任一脚本均可用 `CHIP=xxx scripts/xxx.sh` 覆盖，无需改代码。原入口在`0x0`别名下会算错CRT地址，现已增加绝对跳转；`run.sh`仍保留上述显式入口启动链路，便于重复调试。
 
 ## 上板验证计划（S0–S5）
 
@@ -119,9 +121,10 @@ probe-rs debug --chip CH32V208WBU6 build/ch32v208_nimble.elf \
 
 ## 上板调试记录（2026-10-28 bring-up）
 
-### 中断属性与 HPE（持续更新）
+### 中断属性与 HPE（历史排查）
 
-**当前状态：startup 已改为 `INTSYSCR=0x2`（中断嵌套开、HPE 硬件压栈关），上板验证中。**
+以下为2026-10-28的排查历史，含已推翻的假设。当前startup使用`INTSYSCR=0x0`，
+关闭嵌套与HPE；BB/LLE IRQ已启用，收发完成由中断处理。以顶部最新记录为准。
 
 - `interrupt("WCH-Interrupt-fast")` 告诉编译器“硬件会保存寄存器”，依赖 **HPE（硬件压栈）**：CSR `0x804`（INTSYSCR）bit0 `HWSTKEN`。RM 9.5.3.1 的复位值确为 0，但**本项目 startup（`startup_ch32v20x_D8W.S`）原来显式写 `0x3`（HPE+嵌套都开）**——早期“HPE 默认关、fast 属性缺保护现场”的推断前提不成立。
 - **崩溃事实链（三轮一致）**：每轮都死在 `hw: rng_seed` 打印后 ~1 ms 内，`mcause=4`、`mtval=0x7B21AF17`；反汇编定位在 `xTaskIncrementTick`（tasks.c:2853）读 `pxCurrentTCB->uxPriority`——即 `pxCurrentTCB`（0x2000036C）被写成 `0x7B21AEEB`（= mtval−44，TCB 内 uxPriority 偏移）。该值跨构建、跨运行**完全确定**，且不在 flash 镜像里。rng_seed 阶段纯软件部分（xorshift、UID/MAC 只读）无任何野写路径，SDK ADC 调用只写外设寄存器 ⇒ 写入者是**异步的**。

@@ -92,10 +92,18 @@ static void phy_wfr_expired(void *arg)
 }
 
 /* Software scheduling (v1 timing model) */
+static uint32_t s_rx_end_cputime;
+static uint8_t s_rx_end_payload_len;
+/* Board-calibrated at 96 MHz: wait from RX done before RF preparation.
+ * The remaining RF path plus ~34 us hardware start delay completes T_IFS.
+ * Scope-level timing/conformance and other clock rates remain unvalidated. */
+volatile uint32_t g_wch_phy_response_delay_us = 108;
 static uint8_t s_tx_sched_valid;
 static uint32_t s_tx_sched_cputime;
 static uint8_t s_tx_sched_rem_us;
 static uint8_t s_rx_sched_valid;
+static uint32_t s_rx_air_start_cputime;
+static int ble_phy_rx(void);
 static uint32_t s_rx_sched_cputime;
 static uint8_t s_rx_sched_rem_us;
 
@@ -244,32 +252,31 @@ phy_rx_done_isr(uint32_t ts)
 {
     uint8_t *rxbuf = g_ble_phy_rx_buf;
     struct ble_mbuf_hdr *ble_hdr = &g_ble_phy_data.rxhdr;
-    uint16_t len;
     int rc;
 
     if (g_ble_phy_data.phy_state != BLE_PHY_STATE_RX) {
         return;
     }
 
+    s_rx_end_cputime = ts;
+    s_rx_end_payload_len = rxbuf[1];
     (void)hal_timer_stop(&s_phy_wfr_timer);
     g_ble_phy_data.phy_rx_started = 1;
     ++g_ble_phy_stats.rx_starts;
 
-    len = rxbuf[1];
-    if (len > (BLE_PHY_MAX_PDU_LEN - BLE_LL_PDU_HDR_LEN)) {
-        len = BLE_PHY_MAX_PDU_LEN - BLE_LL_PDU_HDR_LEN;
-    }
-
-    /* Provisional header (CRC verdict added below). RSSI comes from BB+0x30
-     * bits[22:15]; anchor timestamp = BB clock-capture (RE §5.2) taken at
-     * access-address match, falling back to the completion timestamp. */
+    /* BB clock capture is after address detection, not the first preamble
+     * bit. Infer packet start from completed airtime instead of handing that
+     * later capture point to the connection scheduler as its anchor. */
     ble_hdr->rxinfo.flags = ble_ll_state_get();
     ble_hdr->rxinfo.channel = g_ble_phy_data.phy_chan;
     ble_hdr->rxinfo.handle = 0;
     ble_hdr->rxinfo.rssi = wch_rf_rssi();
-    ble_hdr->rxinfo.phy = BLE_PHY_1M;
-    ble_hdr->rxinfo.phy_mode = BLE_PHY_MODE_1M;
-    ble_hdr->beg_cputime = wch_rf_last_anchor() ? wch_rf_last_anchor() : ts;
+    ble_hdr->rxinfo.phy_mode = g_ble_phy_data.phy_rx_phy_mode;
+    ble_hdr->rxinfo.phy = ble_hdr->rxinfo.phy_mode == BLE_PHY_MODE_2M ?
+                          BLE_PHY_2M : BLE_PHY_1M;
+    uint32_t airtime_us = ble_hdr->rxinfo.phy_mode == BLE_PHY_MODE_2M ?
+                          4U * (rxbuf[1] + 11U) : 8U * (rxbuf[1] + 10U);
+    ble_hdr->beg_cputime = ts - airtime_us;
     ble_hdr->rem_usecs = 0;
 
     /*
@@ -442,7 +449,8 @@ ble_phy_rx_set_start_time(uint32_t cputime, uint8_t rem_usecs)
         ++g_ble_phy_stats.rx_late;
         /* Like nrf5x: still attempt reception. */
     }
-    return 0;
+    /* LL callers do not call a separate RX arm function. */
+    return ble_phy_rx();
 }
 
 void
@@ -459,8 +467,9 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
     uint8_t pyld_len;
     int rc;
 
-    /* In basic mode rx_started is set only at RX completion. The LL can
-     * request a scan/data response from ble_ll_rx_end while state is RX. */
+    bool response = ble_phy_state_get() == BLE_PHY_STATE_RX &&
+                    g_ble_phy_data.phy_rx_started;
+    /* The LL requests a scan/data response from ble_ll_rx_end. */
     if (ble_phy_state_get() != BLE_PHY_STATE_IDLE &&
         !(ble_phy_state_get() == BLE_PHY_STATE_RX &&
           g_ble_phy_data.phy_rx_started)) {
@@ -498,6 +507,20 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
     }
     s_tx_sched_valid = 0;
 
+    if (response) {
+        /* Basic-mode responses need an explicit IFS wait. Starting a new
+         * TX immediately replies too early for the central's RX window. */
+        /* Vendor LLE_IRQSubHandler 0x33902..0x339ee uses turnaround
+         * {93,97,101,105,107} half-us for RX payload {0,1,2,3,>=4}.
+         * Short frames reach the CPU later relative to their air end. */
+        uint32_t short_adjust = s_rx_end_payload_len < 4 ?
+            (107U - (93U + 4U * s_rx_end_payload_len)) / 2U : 0U;
+        uint32_t delay = g_wch_phy_response_delay_us > short_adjust ?
+            g_wch_phy_response_delay_us - short_adjust : 0U;
+        uint32_t start = s_rx_end_cputime + delay;
+        while ((int32_t)(os_cputime_get32() - start) < 0) {
+        }
+    }
     g_ble_phy_data.phy_state = BLE_PHY_STATE_TX;
 
     rc = wch_rf_tx_basic(g_ble_phy_tx_buf,
@@ -595,7 +618,7 @@ ble_phy_disable(void)
     s_rx_sched_valid = 0;
 }
 
-int
+static int
 ble_phy_rx(void)
 {
     int rc;
@@ -612,6 +635,8 @@ ble_phy_rx(void)
 
     /* v1 software scheduling: wait until (start - guard).  Never late-error
      * on RX (attempt anyway, like nrf5x). */
+    s_rx_air_start_cputime = s_rx_sched_valid ?
+        s_rx_sched_cputime + s_rx_sched_rem_us : os_cputime_get32();
     if (s_rx_sched_valid) {
         (void)wait_until_start(s_rx_sched_cputime, s_rx_sched_rem_us);
         s_rx_sched_valid = 0;
@@ -665,20 +690,25 @@ ble_phy_wfr_enable(int txrx, uint8_t tx_phy_mode, uint32_t wfr_usecs)
     }
 
     if (g_ble_phy_data.phy_state != BLE_PHY_STATE_RX) {
-        g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
-        g_ble_phy_data.phy_rx_started = 0;
-        (void)wch_rf_rx_basic(g_ble_phy_rx_buf, WCH_RF_RX_BUFFER_SIZE,
-                              rx_window_default_half_us());
+        if (ble_phy_rx() != 0) {
+            return;
+        }
     }
 
-    /* Refine the live RX window: LL-provided wfr + C_PHY allowance, in
-     * 0.5 us units (RE §12.1/§12.2). */
-    if (wfr_usecs > 0) {
-        window = (wfr_usecs + (g_wch_rf_timing.rx_window_widen_half_us / 2)) * 2;
-    } else {
-        window = rx_window_default_half_us();
+    /* WFR is relative to the requested on-air RX start, not to the early
+     * scheduler callback or the instant we program the receiver. Include
+     * preamble/access-address detection and the existing capture allowance. */
+    uint32_t addr_us = g_ble_phy_data.phy_rx_phy_mode == BLE_PHY_MODE_2M ? 24U : 40U;
+    uint32_t deadline = s_rx_air_start_cputime + wfr_usecs + addr_us +
+                       g_wch_rf_timing.rx_window_widen_half_us / 2U;
+    int32_t remaining = (int32_t)(deadline - os_cputime_get32());
+    if (remaining < 1) {
+        remaining = 1;
     }
+    window = (uint32_t)remaining * 2U;
     WCH_LLE_WINDOW = window;
+    (void)hal_timer_start(&s_phy_wfr_timer, (uint32_t)remaining + 100U);
+
 }
 
 void

@@ -13,6 +13,8 @@
 /* Visible diagnostics retain actual measurements and the failing stage. */
 volatile uint32_t g_wch_rf_analog_stage;
 volatile uint32_t g_wch_rf_analog_status;
+volatile uint32_t g_wch_rf_tune_ready_mask;
+volatile uint32_t g_wch_rf_tune_expired_mask;
 volatile uint32_t g_wch_rf_filter_ready;
 volatile uint32_t g_wch_rf_filter_window_expired;
 volatile uint8_t g_wch_rf_analog_co[3]; /* 2401, 2440, 2480 MHz */
@@ -75,12 +77,19 @@ rf_dev_init(void)
     RF(0x38) |= 0x80000000UL;
 }
 
-/* RFEND_WaitTune, 0x34052..0x3408a, checks BOTH ready bits in RF+0x90.
- * The vendor silently returns when its 3000 us LLE window expires. Here
- * expiry is an error; it must not produce a table from unfinished readings.
+/* BLE_IPCoreInit orders LLE -> RFEND DevInit -> BB -> calibration. */
+void
+wch_rf_analog_dev_init(void)
+{
+    rf_dev_init();
+}
+
+/* RFEND_WaitTune, 0x34052..0x3408a: return on BOTH ready bits OR the
+ * 3000 us LLE window ending. Preserve the vendor's bounded fallback and
+ * record which band reached ready; sequence completion alone is not ready.
  */
 static int
-wait_tune(void)
+wait_tune(unsigned sample)
 {
     uint32_t started = os_cputime_get32();
     LLE(0x64) = 6000;
@@ -88,10 +97,14 @@ wait_tune(void)
         uint32_t st = RF(0x90);
         g_wch_rf_analog_status = st;
         if ((st & 0x06000000UL) == 0x06000000UL) {
+            g_wch_rf_tune_ready_mask |= 1U << sample;
             return 0;
         }
-        if (LLE(0x64) == 0 ||
-            (uint32_t)(os_cputime_get32() - started) >= CAL_TIMEOUT_US) {
+        if (LLE(0x64) == 0) {
+            g_wch_rf_tune_expired_mask |= 1U << sample;
+            return 0;
+        }
+        if ((uint32_t)(os_cputime_get32() - started) >= CAL_TIMEOUT_US) {
             return -1;
         }
     }
@@ -136,7 +149,7 @@ rf_txctune(void)
         RF(0x38) = (RF(0x38) & 0xfffe00ffUL) |
                    ((uint32_t)bands[i] << 8);
         RF(0x04) |= 1;
-        if (wait_tune() != 0) {
+        if (wait_tune(sample) != 0) {
             RF(0x04) &= ~0x11UL;
             RF(0x28) |= 0x1000;
             RF(0x2c) |= 0x10;
@@ -229,7 +242,8 @@ rf_rxadc(void)
 
 /* Call after BLE AHB clock, cputime, LLE_DevInit and BB_DevInit are ready.
  * Calibration power/PHY envelope: BLE_RegInit 0x13e24..0x13eae.
- * Return -1/-2/-3 for low/high/mid VCO readiness, -4 for filter readiness.
+ * Return -1/-2/-3 if low/high/mid VCO polling cannot finish even its
+ * bounded hardware window; -4 for a stalled filter window.
  */
 int
 wch_rf_analog_init(void)
@@ -239,7 +253,8 @@ wch_rf_analog_init(void)
     LLE(0x0c) = 0;
     __asm volatile ("fence.i" ::: "memory");
     g_wch_rf_analog_stage = 1;
-    rf_dev_init();
+    g_wch_rf_tune_ready_mask = 0;
+    g_wch_rf_tune_expired_mask = 0;
     BB(0) = (BB(0) & ~0x3000UL) | 0x1000;
     BB(0) &= ~0x180UL;
     BB(0) = (BB(0) & ~0x180UL) | 0x100;
