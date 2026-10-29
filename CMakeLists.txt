@@ -28,6 +28,7 @@ endif()
 
 # --------------------------------------------------------------- options ---
 set(CH32_CHIP "CH32V208WBU6" CACHE STRING "probe-rs chip name used in docs/scripts")
+option(CH32_BLE_TEST_IDENTITY "Use a separate static random address for GATT schema testing" OFF)
 
 # ------------------------------------------------------------- flags -------
 add_compile_options(
@@ -164,6 +165,8 @@ add_executable(ch32v208_nimble
 # .elf suffix so scripts/ and probe-rs commands can reference
 # build/ch32v208_nimble.elf verbatim.
 set_target_properties(ch32v208_nimble PROPERTIES SUFFIX ".elf")
+target_compile_definitions(ch32v208_nimble PRIVATE
+    APP_BLE_TEST_IDENTITY=$<BOOL:${CH32_BLE_TEST_IDENTITY}>)
 # wch_ble and nimble_core reference each other (LL calls ble_phy_*, the PHY
 # port calls ble_ll_*), so the archives must be rescanned as a group.
 target_link_libraries(ch32v208_nimble

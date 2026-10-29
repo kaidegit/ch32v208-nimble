@@ -75,9 +75,41 @@ struct ble_phy_stats
     uint32_t radio_state_errs;
     uint32_t no_bufs;
     uint32_t hw_errs;
+    uint32_t tx_good_1m;
+    uint32_t tx_good_2m;
+    uint32_t rx_valid_1m;
+    uint32_t rx_valid_2m;
 };
 
 static struct ble_phy_stats g_ble_phy_stats;
+
+/* Small PHY control PDU trace for distinguishing a peer's no-change reply
+ * from a local mode-programming failure. Only CRC-valid RX is recorded. */
+struct phy_control_trace {
+    uint32_t seq;
+    uint8_t tx, len, payload[6];
+};
+volatile struct phy_control_trace g_wch_phy_control_trace[16];
+volatile uint32_t g_wch_phy_control_seq;
+
+static void
+phy_trace_control(uint8_t tx, const uint8_t *frame)
+{
+    if (ble_ll_state_get() != BLE_LL_STATE_CONNECTION ||
+        (frame[0] & 3U) != 3U || frame[1] < 3 ||
+        frame[2] < 0x16 || frame[2] > 0x18) {
+        return;
+    }
+    uint32_t seq = g_wch_phy_control_seq++;
+    volatile struct phy_control_trace *rec = &g_wch_phy_control_trace[seq & 15U];
+    rec->seq = seq;
+    rec->tx = tx;
+    rec->len = frame[1];
+    for (unsigned i = 0; i < sizeof rec->payload; ++i) {
+        rec->payload[i] = i < frame[1] ? frame[i + 2] : 0;
+    }
+}
+
 
 /* TX frame: [hdr][len][payload]; RX buffer keeps a small guard tail */
 static uint8_t g_ble_phy_tx_buf[BLE_PHY_MAX_PDU_LEN] __attribute__((aligned(4)));
@@ -225,6 +257,11 @@ phy_tx_done_isr(uint32_t ts)
     }
 
     ++g_ble_phy_stats.tx_good;
+    if (g_ble_phy_data.phy_tx_phy_mode == BLE_PHY_MODE_2M) {
+        ++g_ble_phy_stats.tx_good_2m;
+    } else {
+        ++g_ble_phy_stats.tx_good_1m;
+    }
     if (transition == BLE_PHY_TRANSITION_TX_RX) {
         /* Basic sequencer stages have unambiguous completion flags.
          * Listen after TX while the controller waits for a scan/connect
@@ -298,6 +335,12 @@ phy_rx_done_isr(uint32_t ts)
     if (wch_rf_rx_crc_ok()) {
         ble_hdr->rxinfo.flags |= BLE_MBUF_HDR_F_CRC_OK;
         ++g_ble_phy_stats.rx_valid;
+        phy_trace_control(0, rxbuf);
+        if (g_ble_phy_data.phy_rx_phy_mode == BLE_PHY_MODE_2M) {
+            ++g_ble_phy_stats.rx_valid_2m;
+        } else {
+            ++g_ble_phy_stats.rx_valid_1m;
+        }
     } else {
         ++g_ble_phy_stats.rx_crc_err;
     }
@@ -492,6 +535,7 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
                      &hdr_byte);
     g_ble_phy_tx_buf[0] = hdr_byte;
     g_ble_phy_tx_buf[1] = pyld_len;
+    phy_trace_control(1, g_ble_phy_tx_buf);
 
     g_ble_phy_data.phy_transition = end_trans;
     wch_rf_auto_arm_rx(end_trans == BLE_PHY_TRANSITION_TX_RX);
@@ -510,10 +554,11 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
     if (response) {
         /* Basic-mode responses need an explicit IFS wait. Starting a new
          * TX immediately replies too early for the central's RX window. */
-        /* Vendor LLE_IRQSubHandler 0x33902..0x339ee uses turnaround
-         * {93,97,101,105,107} half-us for RX payload {0,1,2,3,>=4}.
-         * Short frames reach the CPU later relative to their air end. */
-        uint32_t short_adjust = s_rx_end_payload_len < 4 ?
+        /* Vendor 0x338fa..0x33900 selects this short-frame table only
+         * when BB PHY bits are zero (2M). 1M uses fixed108 half-us at
+         * 0x339f0; 2M uses{93,97,101,105,107} for{0,1,2,3,>=4}. */
+        uint32_t short_adjust = g_ble_phy_data.phy_rx_phy_mode == BLE_PHY_MODE_2M &&
+                                s_rx_end_payload_len < 4 ?
             (107U - (93U + 4U * s_rx_end_payload_len)) / 2U : 0U;
         uint32_t delay = g_wch_phy_response_delay_us > short_adjust ?
             g_wch_phy_response_delay_us - short_adjust : 0U;
@@ -806,8 +851,8 @@ ble_phy_resolv_list_disable(void)
 }
 
 /* Unconditional: upstream ble_ll_adv/conn/scan call sites are not feature-
- * gated, so the symbol must exist even with 2M/coded disabled.  v1 clamps
- * every mode to 1M inside wch_rf_phy_mode_set(). */
+ * gated, so the symbol must exist even when optional PHYs are disabled.
+ * Coded modes remain unsupported; 1M and 2M map directly to WCH modes. */
 void
 ble_phy_mode_set(uint8_t tx_phy_mode, uint8_t rx_phy_mode)
 {

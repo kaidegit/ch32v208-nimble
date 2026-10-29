@@ -5,16 +5,20 @@ import Darwin
 let serviceID = CBUUID(string: "7a02480e-6d4d-4e8e-b7a2-d1c4a2f13e01")
 let uptimeID = CBUUID(string: "7a02480e-6d4d-4e8e-b7a2-d1c4a2f13e02")
 let echoID = CBUUID(string: "7a02480e-6d4d-4e8e-b7a2-d1c4a2f13e03")
+let phyID = CBUUID(string: "7a02480e-6d4d-4e8e-b7a2-d1c4a2f13e04")
 
 let usage = """
 Usage: ble.sh scan [--name EXACT_NAME] [--id COREBLUETOOTH_UUID] [--timeout SECONDS] [--duplicates]
-       ble.sh probe [--name EXACT_NAME] [--id COREBLUETOOTH_UUID] [--timeout SECONDS] [--write-hex HEX]
+       ble.sh probe [--name EXACT_NAME] [--id COREBLUETOOTH_UUID] [--timeout SECONDS] [--write-hex HEX] [--phy 1m|2m|1m,2m,1m]
        ble.sh --self-test
 
 scan defaults to all nearby BLE devices for 15 seconds. Filters only mark matching
 advertisements; all discovered devices are logged. probe connects to one exact
 match (default name CH32V208-NIMBLE), discovers GATT, and reads uptime and echo.
 --write-hex optionally writes the test echo characteristic and verifies readback.
+--phy requests matching TX/RX PHY through the board test service and checks the
+negotiated PHY before and after the data operations; refused PHY is a failure.
+A comma-separated PHY list repeats these operations within the same connection.
 The timeout covers the entire scan/connect/read session. All output is JSONL.
 CoreBluetooth exposes macOS UUIDs, not over-the-air BLE MAC addresses or raw PDUs.
 """
@@ -46,6 +50,7 @@ struct Options {
     var timeout = 15.0
     var duplicates = false
     var write: Data?
+    var phys: [UInt8] = []
 
     init(_ args: [String]) throws {
         guard let first = args.first, first == "scan" || first == "probe" else { throw CLIError(usage) }
@@ -67,12 +72,19 @@ struct Options {
                 guard let seconds = Double(value), seconds.isFinite, seconds > 0, seconds <= 3600 else { throw CLIError("--timeout must be in (0, 3600] seconds") }
                 timeout = seconds
             case "--write-hex": write = try parseHex(value)
+            case "--phy":
+                let rates = value.split(separator: ",", omittingEmptySubsequences: false)
+                guard !rates.isEmpty, rates.count <= 16,
+                      rates.allSatisfy({ $0 == "1m" || $0 == "2m" }) else {
+                    throw CLIError("--phy requires 1m or 2m, optionally comma-separated (up to16)")
+                }
+                phys = rates.map { $0 == "1m" ? 1 : 2 }
             default: throw CLIError("unknown option \(option)")
             }
             i += 2
         }
         if mode == "probe", name == nil, id == nil { name = "CH32V208-NIMBLE" }
-        if mode == "scan", write != nil { throw CLIError("--write-hex requires probe") }
+        if mode == "scan", write != nil || !phys.isEmpty { throw CLIError("--write-hex and --phy require probe") }
     }
 
     func matches(id candidate: UUID, localName: String?, peripheralName: String?) -> Bool {
@@ -133,6 +145,10 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     var characteristicCount = 0
     var uptime: CBCharacteristic?
     var echo: CBCharacteristic?
+    var phy: CBCharacteristic?
+    var phyRequestedAt: Date?
+    var pendingPhys: [UInt8] = []
+    var currentPhy: UInt8?
     var actions: [(String, CBCharacteristic)] = []
     var currentAction: String?
     var failures = 0
@@ -144,7 +160,8 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         emit("start", ["mode": options.mode, "timeout_seconds": options.timeout,
                        "name_filter": options.name as Any? ?? NSNull(),
                        "id_filter": options.id?.uuidString as Any? ?? NSNull(),
-                       "write_hex": options.write?.hex as Any? ?? NSNull()])
+                       "write_hex": options.write?.hex as Any? ?? NSNull(),
+                       "requested_phys": options.phys])
         timer = Timer.scheduledTimer(withTimeInterval: options.timeout, repeats: false) { [weak self] _ in
             guard let self = self else { return }
             if !self.startedScan {
@@ -290,6 +307,7 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             if service.uuid == serviceID {
                 if characteristic.uuid == uptimeID { uptime = characteristic }
                 if characteristic.uuid == echoID { echo = characteristic }
+                if characteristic.uuid == phyID { phy = characteristic }
             }
         }
         pendingServices -= 1
@@ -304,11 +322,21 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard uptime.properties.contains(.read), echo.properties.contains(.read) else {
             finish(code: 5, reason: "test_characteristics_not_readable"); return
         }
-        actions = [("read_uptime", uptime), ("read_echo", echo)]
-        if options.write != nil {
-            guard echo.properties.contains(.write) else { finish(code: 5, reason: "echo_not_writable"); return }
-            actions.append(("write_echo", echo))
-            actions.append(("verify_echo", echo))
+        if options.write != nil && !echo.properties.contains(.write) {
+            finish(code: 5, reason: "echo_not_writable"); return
+        }
+        if !options.phys.isEmpty && (phy == nil || !phy!.properties.contains(.read) || !phy!.properties.contains(.write)) {
+            emit("error", ["message": "PHY control characteristic missing or inaccessible; macOS can cache the old schema. See CH32_BLE_TEST_IDENTITY in the tool README."])
+            finish(code: 5, reason: "phy_control_missing"); return
+        }
+        actions = []
+        pendingPhys = options.phys
+        let rounds = max(1, options.phys.count)
+        for _ in 0..<rounds {
+            if !options.phys.isEmpty { actions += [("set_phy", phy!), ("wait_phy", phy!)] }
+            actions += [("read_uptime", uptime), ("read_echo", echo)]
+            if options.write != nil { actions += [("write_echo", echo), ("verify_echo", echo)] }
+            if !options.phys.isEmpty { actions.append(("verify_phy", phy!)) }
         }
         nextAction()
     }
@@ -320,7 +348,16 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         currentAction = action
         phase = action
         emit("gatt_operation", ["operation": action, "uuid": characteristic.uuid.uuidString])
-        if action == "write_echo" {
+        if action == "set_phy" {
+            currentPhy = pendingPhys.removeFirst()
+            // Allow the central's automatic connection-setup PHY procedure
+            // to settle before issuing an explicit test request.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self = self, !self.finished else { return }
+                self.phyRequestedAt = Date()
+                peripheral.writeValue(Data([self.currentPhy!]), for: characteristic, type: .withResponse)
+            }
+        } else if action == "write_echo" {
             peripheral.writeValue(options.write!, for: characteristic, type: .withResponse)
         } else {
             peripheral.readValue(for: characteristic)
@@ -328,6 +365,33 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard !finished else { return }
+        if characteristic.uuid == phyID {
+            guard error == nil, let data = characteristic.value, data.count == 6, data[0] == 1 else {
+                emit("error", ["message": error?.localizedDescription ?? "invalid PHY status"])
+                finish(code: 5, reason: "phy_status_failed"); return
+            }
+            emit("phy_status", ["operation": currentAction ?? "unknown", "tx_phy": data[1], "rx_phy": data[2],
+                                "pending": data[3] != 0, "status": data[4], "requested_mask": data[5]])
+            // A central can finish its own initial PHY procedure while our
+            // request is queued. Wait for the requested result, not merely
+            // the first successful Update Complete event after the write.
+            if currentAction == "wait_phy", (data[3] != 0 || data[1] != currentPhy || data[2] != currentPhy),
+               data[4] == 0 || data[4] == 0xff {
+                guard Date().timeIntervalSince(phyRequestedAt ?? started) < 8 else {
+                    finish(code: 5, reason: "phy_update_timeout"); return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    guard let self = self, !self.finished else { return }
+                    peripheral.readValue(for: characteristic)
+                }
+                return
+            }
+            guard data[3] == 0, data[4] == 0, data[1] == currentPhy, data[2] == currentPhy else {
+                finish(code: 5, reason: "phy_not_selected"); return
+            }
+            nextAction(); return
+        }
         if let error = error {
             failures += 1
             emit("read_error", ["operation": currentAction ?? "unknown", "uuid": characteristic.uuid.uuidString, "message": error.localizedDescription])
@@ -349,10 +413,14 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard !finished else { return }
         if let error = error {
             failures += 1
             emit("write_error", ["uuid": characteristic.uuid.uuidString, "message": error.localizedDescription])
-        } else { emit("write", ["uuid": characteristic.uuid.uuidString, "hex": options.write!.hex]) }
+        } else {
+            let data = characteristic.uuid == phyID ? Data([currentPhy!]) : options.write!
+            emit("write", ["uuid": characteristic.uuid.uuidString, "hex": data.hex])
+        }
         nextAction()
     }
 }
@@ -371,7 +439,10 @@ func selfTest() throws {
     guard byID.matches(id: identifier, localName: "board", peripheralName: nil),
           !byID.matches(id: UUID(), localName: "board", peripheralName: nil),
           !byID.matches(id: identifier, localName: "other", peripheralName: nil) else { throw CLIError("combined filter failed") }
-    for invalid in [["scan", "--timeout", "nan"], ["scan", "--timeout", "0"], ["probe", "--id", "abc"], ["scan", "--write-hex", "00"], ["probe", "--write-hex", "0g"], ["probe", "--write-hex", "0"], ["probe", "--write-hex", String(repeating: "00", count: 65)]] {
+    guard try Options(["probe", "--phy", "2m"]).phys == [2],
+          try Options(["probe", "--phy", "1m"]).phys == [1],
+          try Options(["probe", "--phy", "1m,2m,1m"]).phys == [1,2,1] else { throw CLIError("PHY options failed") }
+    for invalid in [["probe", "--phy", "1m,,2m"], ["scan", "--phy", "2m"], ["probe", "--phy", "coded"], ["scan", "--timeout", "nan"], ["scan", "--timeout", "0"], ["probe", "--id", "abc"], ["scan", "--write-hex", "00"], ["probe", "--write-hex", "0g"], ["probe", "--write-hex", "0"], ["probe", "--write-hex", String(repeating: "00", count: 65)]] {
         if (try? Options(invalid)) != nil { throw CLIError("accepted invalid options: \(invalid)") }
     }
     emit("self_test", ["passed": true])

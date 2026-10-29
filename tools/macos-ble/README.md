@@ -26,6 +26,12 @@ tools/macos-ble/ble.sh probe --timeout 30
 # Explicit opt-in: write up to 64 bytes to echo, then verify the readback.
 tools/macos-ble/ble.sh probe --name CH32V208-NIMBLE --write-hex '00 11 22 33' --timeout 30
 
+# Request 2M for both directions, verify the negotiated PHY, then write/read.
+tools/macos-ble/ble.sh probe --phy 2m --write-hex '00 11 22 33' --timeout 30
+
+# Switch PHY without disconnecting; run the data operations at each rate.
+tools/macos-ble/ble.sh probe --phy 1m,2m --write-hex '00 ff 80 7f' --timeout 40
+
 # Select an exact CoreBluetooth identifier from an advertisement event.
 tools/macos-ble/ble.sh probe --id XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX --timeout 30
 ```
@@ -76,3 +82,30 @@ self-test failure; `3` Bluetooth unavailable/unauthorized/startup timeout; `4`
 target not found or probe timeout; `5` connection/GATT/test failure; `130` Ctrl-C.
 A completed scan may have zero target matches; inspect `matched_devices` in the
 summary. Use `probe` when target absence should yield a nonzero exit status.
+
+PHY tests require the new `…3e04` characteristic. Write a one-byte mask (`01`
+for 1M or `02` for 2M). Its six-byte status is `[version=1, HCI TX PHY, HCI RX PHY,
+pending, last update status, requested mask]`; HCI PHY values 1/2 mean 1M/2M.
+The firmware uses NimBLE's HCI Set PHY / Read PHY commands and reports the
+PHY Update Complete event. The client allows one second for initial procedures
+to settle, then waits up to eight seconds per transition,
+checks both directions before and after GATT data operations, and fails if the
+requested rate was refused or a transition timed out. It does not infer link
+speed from elapsed GATT time. Legacy advertisements remain on 1M.
+
+macOS may cache the old GATT database for this board's public address and omit
+`…3e04` even after reflashing. The firmware has a separate test identity option:
+
+```sh
+cmake -S . -B build -DCH32_BLE_TEST_IDENTITY=ON
+cmake --build build
+scripts/run.sh --verify
+```
+
+This uses a deterministic static random address derived from the public address,
+with no persistent writes. The name stays `CH32V208-NIMBLE`; CoreBluetooth assigns
+a different identifier to that identity. The option defaults to OFF; use
+`-DCH32_BLE_TEST_IDENTITY=OFF` to restore public-address advertising. Its purpose
+is fresh service discovery during schema changes, not PHY selection. This
+workaround is not evidence that the public-address firmware lacks the new service.
+Coded PHY is disabled and is not accepted by `--phy`.

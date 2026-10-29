@@ -86,6 +86,14 @@ static const ble_uuid128_t app_chr_echo_uuid =
     BLE_UUID128_INIT(0x03, 0x3e, 0xf1, 0xa2, 0xc4, 0xd1, 0xa2, 0xb7,
                      0x8e, 0x4e, 0x4d, 0x6d, 0x0e, 0x48, 0x02, 0x7a);
 
+/* PHY test control/status: write mask 1 (1M) or 2 (2M); read version,
+ * HCI TX/RX PHY, pending, last update status, requested mask (six bytes). */
+static const ble_uuid128_t app_chr_phy_uuid =
+    BLE_UUID128_INIT(0x04, 0x3e, 0xf1, 0xa2, 0xc4, 0xd1, 0xa2, 0xb7,
+                     0x8e, 0x4e, 0x4d, 0x6d, 0x0e, 0x48, 0x02, 0x7a);
+static uint16_t app_chr_phy_handle;
+static uint8_t app_phy_pending, app_phy_status, app_phy_requested;
+
 /* GATT state: value handles are filled in by the gatts_register_cb. */
 static uint16_t app_chr_uptime_handle;
 static uint16_t app_chr_echo_handle;
@@ -111,10 +119,23 @@ app_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 {
     uint32_t uptime;
     uint16_t i;
+    uint8_t phy[6] = {1, 0, 0, 0, 0, 0};
+    uint16_t len;
     int rc;
 
     switch (ctxt->op) {
     case BLE_GATT_ACCESS_OP_READ_CHR:
+        if (attr_handle == app_chr_phy_handle) {
+            rc = ble_gap_read_le_phy(conn_handle, &phy[1], &phy[2]);
+            if (rc != 0) {
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            phy[3] = app_phy_pending;
+            phy[4] = app_phy_status;
+            phy[5] = app_phy_requested;
+            return os_mbuf_append(ctxt->om, phy, sizeof phy) == 0 ?
+                   0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
         if (attr_handle == app_chr_uptime_handle) {
             uptime = app_uptime_seconds();
             rc = os_mbuf_append(ctxt->om, &uptime, sizeof uptime);
@@ -127,6 +148,25 @@ app_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_READ_NOT_PERMITTED;
 
     case BLE_GATT_ACCESS_OP_WRITE_CHR:
+        if (attr_handle == app_chr_phy_handle) {
+            rc = ble_hs_mbuf_to_flat(ctxt->om, phy, 1, &len);
+            if (rc != 0 || len != 1 || (phy[0] != 1 && phy[0] != 2)) {
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            }
+            if (app_phy_pending) {
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            rc = ble_gap_set_prefered_le_phy(conn_handle, phy[0], phy[0], 0);
+            console_printf("phy: request handle=%u mask=%u rc=%d\n",
+                           conn_handle, phy[0], rc);
+            if (rc != 0) {
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            app_phy_requested = phy[0];
+            app_phy_pending = 1;
+            app_phy_status = 0xff;
+            return 0;
+        }
         if (attr_handle == app_chr_echo_handle) {
             rc = ble_hs_mbuf_to_flat(ctxt->om, app_echo_buf,
                                      sizeof app_echo_buf, &app_echo_len);
@@ -165,6 +205,11 @@ static const struct ble_gatt_svc_def app_gatt_svcs[] = { {
         .arg = NULL,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
         .val_handle = &app_chr_echo_handle,
+    }, {
+        .uuid = &app_chr_phy_uuid.u,
+        .access_cb = app_gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        .val_handle = &app_chr_phy_handle,
     }, {
         0, /* no more characteristics */
     } },
@@ -264,6 +309,25 @@ app_ble_ensure_addr(void)
     ble_addr_t addr;
     int rc;
 
+#if APP_BLE_TEST_IDENTITY
+    /* Separate, deterministic identity for cache-sensitive GATT development.
+     * No option bytes, Flash MAC or persistent storage are changed. */
+    rc = ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, addr.val, NULL);
+    if (rc != 0) {
+        rc = ble_hs_id_gen_rnd(0, &addr);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    addr.val[0] ^= 0x5a;
+    addr.val[5] |= 0xc0;
+    rc = ble_hs_id_set_rnd(addr.val);
+    if (rc == 0) {
+        app_own_addr_type = BLE_OWN_ADDR_RANDOM;
+        console_printf("ble: separate static random test identity enabled\n");
+    }
+    return rc;
+#endif
     rc = ble_hs_id_infer_auto(0, &app_own_addr_type);
     if (rc == 0) {
         return 0;
@@ -296,6 +360,7 @@ app_ble_gap_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
+            app_phy_pending = app_phy_status = app_phy_requested = 0;
             rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
             if (rc == 0) {
                 console_printf("conn: established handle=%d itvl=%d "
@@ -321,6 +386,14 @@ app_ble_gap_event(struct ble_gap_event *event, void *arg)
                        event->disconnect.conn.conn_handle,
                        event->disconnect.reason);
         app_ble_advertise();
+        return 0;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        app_phy_pending = 0;
+        app_phy_status = event->phy_updated.status;
+        console_printf("phy: updated handle=%u status=%u tx=%u rx=%u\n",
+                       event->phy_updated.conn_handle, event->phy_updated.status,
+                       event->phy_updated.tx_phy, event->phy_updated.rx_phy);
         return 0;
 
     case BLE_GAP_EVENT_CONN_UPDATE:

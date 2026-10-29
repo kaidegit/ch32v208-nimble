@@ -10,7 +10,9 @@
 当前实测：55秒运行无异常/断言；Mac连续40秒扫描收到82条目标广播。
 修正接收调度后，Mac连续三次连接均完成服务发现、uptime读取和echo写入/回读：
 64字节、空值和二进制值均通过，单次0.6–1.5秒。复位入口也已修复，可独立运行。
-尚未完成30分钟连接、2M和仪器级时序验证。
+1M/2M均已完成显式PHY确认和64字节写入回读，同连接1M→2M通过；
+本机Mac对2M→1M请求回复no-change。详见[速率测试记录](docs/phy-rates-2026-10-30.md)。
+尚未完成30分钟连接、coded PHY和仪器级时序验证；另记录了复位时的偶发VCO校准超时。
 macOS 测试客户端见 [tools/macos-ble](tools/macos-ble/README.md)。
 旧逆向笔记和下方历史表包含已推翻的寄存器解释，新增驱动修改必须核对原厂指令。
 
@@ -181,7 +183,7 @@ probe-rs debug --chip CH32V208WBU6 build/ch32v208_nimble.elf \
 - **LLE[0x1C]/[0x64] 单位未实测**：超时/自旋计数按逆向推断的 LLE tick 使用，上板后需用逻辑分析仪/RTT 计时校准（RE findings §3.2、§4.3）。
 - **auto-ack 未启用**：v1 收发走手动模式字序列（BB[0x2C] arm 位留待 S3 后开启自动应答）。
 - **RNG 非安全熵源**：控制器随机数来自硬件 LFSR 类源，可用于地址生成，**不可**作为配对/加密密钥熵源（SM v1 未启用，见下）。
-- **privacy / 2M PHY / coded PHY 关闭**：仅 legacy 1M 广播与连接；地址用 public（控制器不回 BD_ADDR 时退化为静态随机）。
+- **privacy / coded PHY 关闭**：legacy广播使用1M；连接支持1M/2M，默认偏好1M，可通过测试服务切换。地址默认public；`CH32_BLE_TEST_IDENTITY=ON`可使用独立静态随机测试地址以重新发现GATT数据库。
 - **SM/配对 v1 不配**：GATT 特征全部无加密要求；`ble_hs_cfg.store_status_cb` 用 NimBLE 标准 `ble_store_util_status_rr` 策略（绑定/白名单写入空操作，状态事件按 rr 策略回复）。
 - host `util`（ble_hs_util_ensure_addr）与 NimBLE 自带 `services/*` 不在编译列表内——应用自带 GATT 服务注册，地址处理见 `app/app_ble.c`。
 
