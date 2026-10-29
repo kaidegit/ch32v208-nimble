@@ -129,6 +129,16 @@ SECTIONS
         PROVIDE(_data_lma = .);
     } >FLASH AT>FLASH
 
+    /* Bring-up forensics: canary pinned beyond the 128K zero-wait window,
+     * AFTER all normal sections so the main image stays contiguous at
+     * 0x08000000.  A wrong result or crash here proves out-of-window
+     * fetches are broken on this chip. */
+    .farcode 0x08021000 :  /* 132K: beyond the 128K CODE window. NO AT>FLASH:
+                           LMA must equal VMA - the CPU fetches the VMA. */
+    {
+        KEEP(*(.farcode))
+    } >FLASH
+
     .data :
     {
         *(.gnu.linkonce.r.*)

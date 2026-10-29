@@ -51,6 +51,24 @@ static StackType_t xIdleTaskStack[ configMINIMAL_STACK_SIZE ];
 static StaticTask_t xTimerTaskTCB;
 static StackType_t xTimerTaskStack[ configTIMER_TASK_STACK_DEPTH ];
 
+/* Bring-up forensics: in-RAM flight recorder.  trace(tag, ra) writes
+ * (tag, ra, tick) into a fixed ring - no printing, no RTT, ~3 stores.
+ * After a silent death, read g_trace_ring via gdb: the last entry's ra
+ * pins the exact call site the bomb hit from. */
+volatile uint32_t g_trace_ring[ 3 * 128 ];
+volatile uint32_t g_trace_wr;
+
+void app_trace( uint32_t tag, void * ra )
+{
+    uint32_t w = g_trace_wr++ & 127U;
+
+    g_trace_ring[ w * 3U ] = tag;
+    g_trace_ring[ w * 3U + 1U ] = ( uint32_t ) ( uintptr_t ) ra;
+    g_trace_ring[ w * 3U + 2U ] = g_trace_wr;  /* seq no. - tick read needs kernel.h */
+}
+
+#define TRACE( n )  app_trace( ( n ), __builtin_return_address( 0 ) )
+
 /* Bring-up forensics: the SysTick sampler (port.c) validates pxCurrentTCB
  * against these three addresses; the sprayer manifests as pxCurrentTCB
  * pointing somewhere else entirely. */
@@ -270,8 +288,9 @@ void wch_watch_store(uint32_t addr)
  * this raises a breakpoint exception (vector slot 3 -> wch_exc_trap). */
 void wch_watch_exec(uint32_t addr)
 {
+    /* mcontrol (type 2): EXECUTE = bit2, M = bit5, action 0 (exception) */
     __asm__ volatile ("csrw 0x7a0, zero");
-    __asm__ volatile ("li t0, 0x20000041; csrw 0x7a1, t0" ::: "t0");
+    __asm__ volatile ("li t0, 0x24; csrw 0x7a1, t0" ::: "t0");
     __asm__ volatile ("csrw 0x7a2, %0" :: "r" (addr));
 }
 
@@ -288,6 +307,14 @@ void wch_watch_probe(void)
     __asm__ volatile ("csrr %0, 0x7a0" : "=r" (sel));
     SEGGER_RTT_printf( 0, "trg: tinfo=%08x sel=%08x tdata1rb=%08x\r\n",
                        ( unsigned ) info, ( unsigned ) sel, ( unsigned ) rb );
+}
+
+/* Bring-up forensics: executes from beyond the 128K zero-wait window. */
+__attribute__( ( section( ".farcode" ), noinline ) )
+int far_add( int a, int b )
+{
+    volatile int t = a * 3;
+    return t + b;
 }
 
 int main( void )
@@ -341,7 +368,14 @@ int main( void )
      * raw exc trap which stashes ra = the culprit call site. */
     {
         extern void wch_watch_probe(void);
+        extern void wch_watch_exec(uint32_t);
         wch_watch_probe();
+        /* The wild jump lands at PC=0 (then re-runs the CRT through the
+         * 0x0 alias).  An execute-trigger at 0 fires BEFORE any
+         * instruction there runs, so the trap stash captures the caller's
+         * ra intact - the null/garbage function pointer call site. */
+        wch_watch_exec( 0x0UL );
+        SEGGER_RTT_WriteString( 0, "trg: exec-watch @0 armed\r\n" );
     }
 
     /* Bring-up forensics: varargs battery.  The silent deaths all landed on
@@ -422,6 +456,50 @@ int main( void )
             }
         }
     }
+
+    /* RM 32.3: code in the flash region BEYOND the zero-wait window
+     * (RAM_CODE_MOD 00x -> 128K) only executes correctly with the FLASH
+     * enhanced-read mode enabled.  The image is ~134K and grows; without
+     * EHMOD every fetch past 0x08020000 returned garbage - the wild jumps
+     * (mcause=0/mepc=0/ra=8/sp=0/gp=0x101) whose death site wandered
+     * between np:5/np:8/rng_seed as the layout shifted between builds.
+     * The WCH closed BLE lib enables this internally; the register-level
+     * driver must do it itself.  FLASH_CTLR(0x40022010).EHMOD = bit24;
+     * FLASH_STATR(0x4002200C).EHMODS = bit7 confirms.  NOTES: exit before
+     * any flash erase/program (option-byte repair above runs BEFORE this
+     * on purpose) and before stop mode; hardware auto-exits on reset.
+     * EHMOD is a "normal+fast unlock" bit: FLASH_CTLR comes up LOCKed
+     * (bit7=1) and silently ignores the write, so run the dual key
+     * sequence (FLASH_Unlock_Fast) first. */
+    {
+        uint32_t ctlr = *( volatile uint32_t * ) 0x40022010UL;
+
+        if( ( ctlr & 0x01000000UL ) == 0UL )
+        {
+            FLASH_Unlock_Fast();
+            *( volatile uint32_t * ) 0x40022010UL =
+                ( *( volatile uint32_t * ) 0x40022010UL ) | 0x01000000UL;
+        }
+        SEGGER_RTT_printf( 0, "ehmod   : CTLR=%08x EHMODS=%u\r\n",
+                           ( unsigned ) *( volatile uint32_t * ) 0x40022010UL,
+                           ( unsigned ) ( ( *( volatile uint32_t * ) 0x4002200CUL >> 7 ) & 1UL ) );
+
+        /* CPU data read beyond the CODE window: if this returns the real
+         * instruction bytes the data path works and only fetch is broken;
+         * 0xFFFFFFFF means the whole controller path is closed. */
+        {
+            uint32_t v = *( volatile uint32_t * ) 0x08021000UL;
+            SEGGER_RTT_printf( 0, "farpeek : %08x\r\n", ( unsigned ) v );
+        }
+    }
+
+    /* Out-of-window execution canary: far_add lives at 0x08020100. */
+    {
+        int r = far_add( 10, 20 );
+        SEGGER_RTT_printf( 0, "farcode : far_add(10,20)=%d %s\r\n", r,
+                           ( r == 50 ) ? "OK" : "WRONG" );
+    }
+
     SEGGER_RTT_WriteString( 0, "==============================\r\n" );
 
     /* Static task inside g_app_zone: stack corruption forensics (see the

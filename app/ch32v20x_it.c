@@ -69,7 +69,7 @@ extern void wch_rf_lle_isr( void ) __attribute__( ( weak ) );
  * did not make it out.
  *********************************************************************/
 volatile uint32_t g_stub_trap_words[ 8 ];
-volatile uint32_t g_exc_trap_words[ 8 ];    /* written by wch_exc_trap (.S) */
+volatile uint32_t g_exc_trap_words[ 40 ];    /* written by wch_exc_trap (.S) */
 volatile uint32_t g_config_assert_line;
 
 void wch_stub_trap_report( uint32_t mcause, uint32_t mepc, uint32_t mtval )
@@ -77,15 +77,14 @@ void wch_stub_trap_report( uint32_t mcause, uint32_t mepc, uint32_t mtval )
     g_stub_trap_words[ 0 ] = mcause;
     g_stub_trap_words[ 1 ] = mepc;
     g_stub_trap_words[ 2 ] = mtval;
-    g_stub_trap_words[ 3 ] = PFIC->IACTR[ 0 ];
-    g_stub_trap_words[ 4 ] = PFIC->IACTR[ 1 ];
-    g_stub_trap_words[ 5 ] = PFIC->GISR;
+    /* words 3-5 hold ra/sp/gp from the .S shim - do not clobber */
+    g_stub_trap_words[ 6 ] = PFIC->IACTR[ 0 ];
+    g_stub_trap_words[ 7 ] = PFIC->GISR;
 
     SEGGER_RTT_printf( 0, "\r\n[STUB-TRAP] mcause=%08x mepc=%08x mtval=%08x\r\n",
                        mcause, mepc, mtval );
-    SEGGER_RTT_printf( 0, "[STUB-TRAP] iactr=%08x %08x %08x gisr=%08x\r\n",
-                       g_stub_trap_words[ 3 ], g_stub_trap_words[ 4 ],
-                       g_stub_trap_words[ 5 ], PFIC->GISR );
+    SEGGER_RTT_printf( 0, "[STUB-TRAP] iactr0=%08x gisr=%08x\r\n",
+                       g_stub_trap_words[ 6 ], g_stub_trap_words[ 7 ] );
     for( ;; )
     {
     }

@@ -245,19 +245,57 @@ OSCWakeUp_IRQHandler:
 	.section	.text.vector_handler, "ax", @progbits
 	.globl	wch_exc_trap
 wch_exc_trap:
+	/* Full machine stash: g_exc_trap_words layout
+	 *  0 mcause  1 mepc   2 mtval  3 mstatus  4 mscratch
+	 *  5..36 x1..x31 (index = regnum+5; x0 skipped, it is 0)
+	 * 37 sp  38 gp  39 tp
+	 * ra(x1) is the return address at trap time; the s-registers
+	 * (x8,x9,x18..x27) fingerprint the function that was executing. */
 	csrr t0, mcause
 	csrr t1, mepc
 	csrr t2, mtval
-	mv   t4, sp
 	la   t3, g_exc_trap_words
 	sw   t0, 0(t3)
 	sw   t1, 4(t3)
 	sw   t2, 8(t3)
-	sw   t4, 12(t3)
-	mv   t0, ra
+	csrr t0, mstatus
+	sw   t0, 12(t3)
+	csrr t0, mscratch
 	sw   t0, 16(t3)
+	mv   t0, sp
+	sw   t0, 4*4+37*4(t3)
 	mv   t0, gp
-	sw   t0, 20(t3)
+	sw   t0, 4*4+38*4(t3)
+	mv   t0, tp
+	sw   t0, 4*4+39*4(t3)
+	sw   x1, 4*4+1*4(t3)
+	sw   x5, 4*4+5*4(t3)
+	sw   x6, 4*4+6*4(t3)
+	sw   x7, 4*4+7*4(t3)
+	sw   x8, 4*4+8*4(t3)
+	sw   x9, 4*4+9*4(t3)
+	sw   x10, 4*4+10*4(t3)
+	sw   x11, 4*4+11*4(t3)
+	sw   x12, 4*4+12*4(t3)
+	sw   x13, 4*4+13*4(t3)
+	sw   x14, 4*4+14*4(t3)
+	sw   x15, 4*4+15*4(t3)
+	sw   x16, 4*4+16*4(t3)
+	sw   x17, 4*4+17*4(t3)
+	sw   x18, 4*4+18*4(t3)
+	sw   x19, 4*4+19*4(t3)
+	sw   x20, 4*4+20*4(t3)
+	sw   x21, 4*4+21*4(t3)
+	sw   x22, 4*4+22*4(t3)
+	sw   x23, 4*4+23*4(t3)
+	sw   x24, 4*4+24*4(t3)
+	sw   x25, 4*4+25*4(t3)
+	sw   x26, 4*4+26*4(t3)
+	sw   x27, 4*4+27*4(t3)
+	sw   x28, 4*4+28*4(t3)
+	sw   x29, 4*4+29*4(t3)
+	sw   x30, 4*4+30*4(t3)
+	sw   x31, 4*4+31*4(t3)
 1:	j 1b
 
 	.section	.text.handle_reset,"ax",@progbits
@@ -292,8 +330,12 @@ handle_reset:
 	addi a0, a0, 4
 	bltu a0, a1, 1b
 2:
-/* Configure pipelining and instruction prediction */
-    li t0, 0x1f
+/* Configure pipelining and instruction prediction.  Bring-up A/B test:
+ * the EVT default 0x1f (all prediction features on) coincides with the
+ * wild-jump crash (mcause=0/mepc=0/ra=8/sp=0/gp=0x101 at tick 12-56);
+ * 0x0 disables all of them.  If the crash disappears, this is a silicon
+ * workaround candidate. */
+    li t0, 0x0
     csrw 0xbc0, t0
 /* INTSYSCR(0x804): 0x0 = interrupt nesting OFF + HPE hardware prologue
  * OFF.  The EVT default was 0x3 (both on).  Bring-up forensics found the
