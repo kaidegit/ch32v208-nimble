@@ -15,6 +15,12 @@ volatile uint32_t g_wch_rf_analog_stage;
 volatile uint32_t g_wch_rf_analog_status;
 volatile uint32_t g_wch_rf_tune_ready_mask;
 volatile uint32_t g_wch_rf_tune_expired_mask;
+/* Preserve the calibration deadline evidence before the failure cleanup
+ * clears the LLE window. Indexed by low/mid/high band, like CO/GA. */
+volatile uint32_t g_wch_rf_tune_started[3];
+volatile uint32_t g_wch_rf_tune_finished[3];
+volatile uint32_t g_wch_rf_tune_window[3];
+volatile uint32_t g_wch_rf_tune_iterations[3];
 volatile uint32_t g_wch_rf_filter_ready;
 volatile uint32_t g_wch_rf_filter_window_expired;
 volatile uint8_t g_wch_rf_analog_co[3]; /* 2401, 2440, 2480 MHz */
@@ -91,22 +97,33 @@ wch_rf_analog_dev_init(void)
 static int
 wait_tune(unsigned sample)
 {
-    uint32_t started = os_cputime_get32();
     LLE(0x64) = 6000;
+    uint32_t started = os_cputime_get32();
+    g_wch_rf_tune_started[sample] = started;
+    g_wch_rf_tune_iterations[sample] = 0;
     for (;;) {
+        ++g_wch_rf_tune_iterations[sample];
+        /* Read the deadline first, then fresh hardware completion state.
+         * A preemption/debug pause between the old window read and a later
+         * CPU-time read could otherwise reject an already expired window. */
+        uint32_t now = os_cputime_get32();
         uint32_t st = RF(0x90);
+        uint32_t window = LLE(0x64);
         g_wch_rf_analog_status = st;
         if ((st & 0x06000000UL) == 0x06000000UL) {
             g_wch_rf_tune_ready_mask |= 1U << sample;
-            return 0;
-        }
-        if (LLE(0x64) == 0) {
+        } else if (window == 0) {
             g_wch_rf_tune_expired_mask |= 1U << sample;
-            return 0;
-        }
-        if ((uint32_t)(os_cputime_get32() - started) >= CAL_TIMEOUT_US) {
+        } else if ((uint32_t)(now - started) < CAL_TIMEOUT_US) {
+            continue;
+        } else {
+            g_wch_rf_tune_finished[sample] = now;
+            g_wch_rf_tune_window[sample] = window;
             return -1;
         }
+        g_wch_rf_tune_finished[sample] = now;
+        g_wch_rf_tune_window[sample] = window;
+        return 0;
     }
 }
 
@@ -199,9 +216,10 @@ rf_rxfilter(void)
     settle();
     RF(0x0c) |= 0x10;
     RF(0x04) |= 0x1000;
-    uint32_t started = os_cputime_get32();
     LLE(0x64) = 80;
+    uint32_t started = os_cputime_get32();
     for (;;) {
+        uint32_t now = os_cputime_get32();
         uint32_t st = RF(0x9c);
         g_wch_rf_analog_status = st;
         if (st & 0x100) {
@@ -215,7 +233,7 @@ rf_rxfilter(void)
             g_wch_rf_filter_window_expired = 1;
             break;
         }
-        if ((uint32_t)(os_cputime_get32() - started) >= CAL_TIMEOUT_US) {
+        if ((uint32_t)(now - started) >= CAL_TIMEOUT_US) {
             RF(0x08) &= ~0x200000UL;
             return -1;
         }

@@ -10,6 +10,7 @@ let phyID = CBUUID(string: "7a02480e-6d4d-4e8e-b7a2-d1c4a2f13e04")
 let usage = """
 Usage: ble.sh scan [--name EXACT_NAME] [--id COREBLUETOOTH_UUID] [--timeout SECONDS] [--duplicates]
        ble.sh probe [--name EXACT_NAME] [--id COREBLUETOOTH_UUID] [--timeout SECONDS] [--write-hex HEX] [--phy 1m|2m|1m,2m,1m]
+       ble.sh probe --phy 1m|2m --duration SECONDS --timeout SECONDS [--interval SECONDS]
        ble.sh --self-test
 
 scan defaults to all nearby BLE devices for 15 seconds. Filters only mark matching
@@ -19,6 +20,8 @@ match (default name CH32V208-NIMBLE), discovers GATT, and reads uptime and echo.
 --phy requests matching TX/RX PHY through the board test service and checks the
 negotiated PHY before and after the data operations; refused PHY is a failure.
 A comma-separated PHY list repeats these operations within the same connection.
+--duration keeps one connection active, repeatedly verifies varying 0..64-byte
+payloads (or --write-hex), checks uptime and PHY, and fails on a 10-second stall.
 The timeout covers the entire scan/connect/read session. All output is JSONL.
 CoreBluetooth exposes macOS UUIDs, not over-the-air BLE MAC addresses or raw PDUs.
 """
@@ -51,6 +54,8 @@ struct Options {
     var duplicates = false
     var write: Data?
     var phys: [UInt8] = []
+    var duration = 0.0
+    var interval = 0.2
 
     init(_ args: [String]) throws {
         guard let first = args.first, first == "scan" || first == "probe" else { throw CLIError(usage) }
@@ -69,8 +74,14 @@ struct Options {
                 guard let uuid = UUID(uuidString: value) else { throw CLIError("--id must be a full CoreBluetooth UUID") }
                 id = uuid
             case "--timeout":
-                guard let seconds = Double(value), seconds.isFinite, seconds > 0, seconds <= 3600 else { throw CLIError("--timeout must be in (0, 3600] seconds") }
+                guard let seconds = Double(value), seconds.isFinite, seconds > 0, seconds <= 86400 else { throw CLIError("--timeout must be in (0, 86400] seconds") }
                 timeout = seconds
+            case "--duration":
+                guard let seconds = Double(value), seconds.isFinite, seconds > 0, seconds <= 86360 else { throw CLIError("--duration must be in (0, 86360] seconds") }
+                duration = seconds
+            case "--interval":
+                guard let seconds = Double(value), seconds.isFinite, seconds >= 0, seconds <= 10 else { throw CLIError("--interval must be in [0, 10] seconds") }
+                interval = seconds
             case "--write-hex": write = try parseHex(value)
             case "--phy":
                 let rates = value.split(separator: ",", omittingEmptySubsequences: false)
@@ -84,7 +95,10 @@ struct Options {
             i += 2
         }
         if mode == "probe", name == nil, id == nil { name = "CH32V208-NIMBLE" }
-        if mode == "scan", write != nil || !phys.isEmpty { throw CLIError("--write-hex and --phy require probe") }
+        if mode == "scan", write != nil || !phys.isEmpty || duration > 0 { throw CLIError("--write-hex, --phy and --duration require probe") }
+        if duration > 0 && (phys.count != 1 || timeout < duration + 15) {
+            throw CLIError("--duration requires exactly one PHY and --timeout at least duration+15")
+        }
     }
 
     func matches(id candidate: UUID, localName: String?, peripheralName: String?) -> Bool {
@@ -92,6 +106,11 @@ struct Options {
         if let name = name, localName != name && peripheralName != name { return false }
         return true
     }
+}
+
+func soakPayload(_ round: Int) -> Data {
+    let lengths = [0, 1, 2, 3, 4, 5, 7, 16, 20, 23, 31, 32, 63, 64]
+    return Data((0..<lengths[round % lengths.count]).map { UInt8(truncatingIfNeeded: round * 131 + $0 * 17) })
 }
 
 extension Data {
@@ -153,6 +172,15 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     var currentAction: String?
     var failures = 0
     var phase = "initializing"
+    var watchdog: Timer?
+    var lastProgress = ProcessInfo.processInfo.systemUptime
+    var soakStarted: TimeInterval?
+    var roundStarted: TimeInterval?
+    var roundsCompleted = 0
+    var verifiedBytes = 0
+    var maxRoundSeconds = 0.0
+    var lastUptime: UInt32?
+    var payload: Data?
 
     init(options: Options) { self.options = options; super.init() }
 
@@ -161,7 +189,7 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                        "name_filter": options.name as Any? ?? NSNull(),
                        "id_filter": options.id?.uuidString as Any? ?? NSNull(),
                        "write_hex": options.write?.hex as Any? ?? NSNull(),
-                       "requested_phys": options.phys])
+                       "requested_phys": options.phys, "duration_seconds": options.duration, "interval_seconds": options.interval])
         timer = Timer.scheduledTimer(withTimeInterval: options.timeout, repeats: false) { [weak self] _ in
             guard let self = self else { return }
             if !self.startedScan {
@@ -171,6 +199,12 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 self.finish(code: 0, reason: "scan_complete")
             } else {
                 self.finish(code: 4, reason: self.target == nil ? "target_not_found" : "timeout_\(self.phase)")
+            }
+        }
+        watchdog = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self = self, self.connected, !self.finished else { return }
+            if ProcessInfo.processInfo.systemUptime - self.lastProgress > max(10, self.options.interval + 5) {
+                self.finish(code: 5, reason: "operation_stalled_\(self.phase)")
             }
         }
         signal(SIGINT, SIG_IGN)
@@ -184,6 +218,7 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     func finish(code: Int32, reason: String) {
         guard !finished else { return }
         finished = true
+        watchdog?.invalidate()
         timer?.invalidate()
         manager?.stopScan()
         if let target = target, target.state == .connected {
@@ -209,7 +244,10 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                          "elapsed_seconds": Date().timeIntervalSince(started),
                          "advertisements": advertisements, "unique_devices": seen.count,
                          "matched_devices": matches.count, "connected": connected,
-                         "characteristics": characteristicCount, "failures": failures])
+                         "characteristics": characteristicCount, "failures": failures,
+                         "rounds_completed": roundsCompleted, "verified_bytes": verifiedBytes,
+                         "soak_elapsed_seconds": soakStarted.map { ProcessInfo.processInfo.systemUptime - $0 } ?? 0,
+                         "max_round_seconds": maxRoundSeconds])
         exit(code)
     }
 
@@ -257,6 +295,7 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        lastProgress = ProcessInfo.processInfo.systemUptime
         connected = true
         phase = "discovering_services"
         emit("connected", ["id": peripheral.identifier.uuidString])
@@ -281,6 +320,7 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        lastProgress = ProcessInfo.processInfo.systemUptime
         if let error = error {
             emit("error", ["message": error.localizedDescription])
             finish(code: 5, reason: "service_discovery_failed"); return
@@ -296,6 +336,7 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        lastProgress = ProcessInfo.processInfo.systemUptime
         if let error = error {
             failures += 1
             emit("error", ["service": service.uuid.uuidString, "message": error.localizedDescription])
@@ -322,7 +363,8 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard uptime.properties.contains(.read), echo.properties.contains(.read) else {
             finish(code: 5, reason: "test_characteristics_not_readable"); return
         }
-        if options.write != nil && !echo.properties.contains(.write) {
+        payload = options.write ?? (options.duration > 0 ? soakPayload(0) : nil)
+        if payload != nil && !echo.properties.contains(.write) {
             finish(code: 5, reason: "echo_not_writable"); return
         }
         if !options.phys.isEmpty && (phy == nil || !phy!.properties.contains(.read) || !phy!.properties.contains(.write)) {
@@ -335,15 +377,39 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         for _ in 0..<rounds {
             if !options.phys.isEmpty { actions += [("set_phy", phy!), ("wait_phy", phy!)] }
             actions += [("read_uptime", uptime), ("read_echo", echo)]
-            if options.write != nil { actions += [("write_echo", echo), ("verify_echo", echo)] }
+            if payload != nil { actions += [("write_echo", echo), ("verify_echo", echo)] }
             if !options.phys.isEmpty { actions.append(("verify_phy", phy!)) }
         }
         nextAction()
     }
 
     func nextAction() {
-        guard let peripheral = target else { return }
-        guard !actions.isEmpty else { finish(code: failures == 0 ? 0 : 5, reason: failures == 0 ? "probe_complete" : "probe_failed"); return }
+        guard !finished, let peripheral = target else { return }
+        guard !actions.isEmpty else {
+            if options.duration > 0 {
+                let now = ProcessInfo.processInfo.systemUptime
+                roundsCompleted += 1
+                maxRoundSeconds = max(maxRoundSeconds, now - (roundStarted ?? now))
+                let elapsed = now - (soakStarted ?? now)
+                emit("soak_round", ["round": roundsCompleted, "elapsed_seconds": elapsed,
+                                    "verified_bytes": verifiedBytes, "phy": currentPhy ?? 0])
+                if elapsed >= options.duration {
+                    finish(code: failures == 0 ? 0 : 5, reason: failures == 0 ? "soak_complete" : "soak_failed")
+                    return
+                }
+                payload = options.write ?? soakPayload(roundsCompleted)
+                phase = "between_rounds"
+                DispatchQueue.main.asyncAfter(deadline: .now() + options.interval) { [weak self] in
+                    guard let self = self, !self.finished else { return }
+                    self.roundStarted = ProcessInfo.processInfo.systemUptime
+                    self.actions = [("read_uptime", self.uptime!), ("write_echo", self.echo!),
+                                    ("verify_echo", self.echo!), ("verify_phy", self.phy!)]
+                    self.nextAction()
+                }
+                return
+            }
+            finish(code: failures == 0 ? 0 : 5, reason: failures == 0 ? "probe_complete" : "probe_failed"); return
+        }
         let (action, characteristic) = actions.removeFirst()
         currentAction = action
         phase = action
@@ -358,13 +424,14 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 peripheral.writeValue(Data([self.currentPhy!]), for: characteristic, type: .withResponse)
             }
         } else if action == "write_echo" {
-            peripheral.writeValue(options.write!, for: characteristic, type: .withResponse)
+            peripheral.writeValue(payload!, for: characteristic, type: .withResponse)
         } else {
             peripheral.readValue(for: characteristic)
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        lastProgress = ProcessInfo.processInfo.systemUptime
         guard !finished else { return }
         if characteristic.uuid == phyID {
             guard error == nil, let data = characteristic.value, data.count == 6, data[0] == 1 else {
@@ -390,35 +457,52 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             guard data[3] == 0, data[4] == 0, data[1] == currentPhy, data[2] == currentPhy else {
                 finish(code: 5, reason: "phy_not_selected"); return
             }
+            if options.duration > 0 && soakStarted == nil {
+                soakStarted = ProcessInfo.processInfo.systemUptime
+                roundStarted = soakStarted
+            }
             nextAction(); return
         }
         if let error = error {
             failures += 1
             emit("read_error", ["operation": currentAction ?? "unknown", "uuid": characteristic.uuid.uuidString, "message": error.localizedDescription])
+            if options.duration > 0 { finish(code: 5, reason: "soak_read_error"); return }
         } else {
             let data = characteristic.value ?? Data()
             var fields: [String: Any] = ["operation": currentAction ?? "unknown", "uuid": characteristic.uuid.uuidString, "hex": data.hex, "length": data.count]
             if characteristic.uuid == uptimeID {
-                if let seconds = data.uint32LE { fields["uptime_seconds"] = seconds }
+                if let seconds = data.uint32LE {
+                    fields["uptime_seconds"] = seconds
+                    if let previous = lastUptime, seconds < previous {
+                        emit("error", ["message": "device uptime moved backwards", "previous": previous, "current": seconds])
+                        finish(code: 5, reason: "device_uptime_reset"); return
+                    }
+                    lastUptime = seconds
+                }
                 else { failures += 1; fields["error"] = "uptime must contain 4 little-endian bytes" }
             }
             if currentAction == "verify_echo" {
-                let valid = data == options.write
+                let valid = data == payload
                 fields["verified"] = valid
-                if !valid { failures += 1 }
+                if !valid { failures += 1 } else { verifiedBytes += data.count }
             }
             emit("read", fields)
+            if options.duration > 0 && failures > 0 {
+                finish(code: 5, reason: "soak_data_verification_failed"); return
+            }
         }
         nextAction()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        lastProgress = ProcessInfo.processInfo.systemUptime
         guard !finished else { return }
         if let error = error {
             failures += 1
             emit("write_error", ["uuid": characteristic.uuid.uuidString, "message": error.localizedDescription])
+            if options.duration > 0 { finish(code: 5, reason: "soak_write_error"); return }
         } else {
-            let data = characteristic.uuid == phyID ? Data([currentPhy!]) : options.write!
+            let data = characteristic.uuid == phyID ? Data([currentPhy!]) : payload!
             emit("write", ["uuid": characteristic.uuid.uuidString, "hex": data.hex])
         }
         nextAction()
@@ -444,6 +528,14 @@ func selfTest() throws {
           try Options(["probe", "--phy", "1m,2m,1m"]).phys == [1,2,1] else { throw CLIError("PHY options failed") }
     for invalid in [["probe", "--phy", "1m,,2m"], ["scan", "--phy", "2m"], ["probe", "--phy", "coded"], ["scan", "--timeout", "nan"], ["scan", "--timeout", "0"], ["probe", "--id", "abc"], ["scan", "--write-hex", "00"], ["probe", "--write-hex", "0g"], ["probe", "--write-hex", "0"], ["probe", "--write-hex", String(repeating: "00", count: 65)]] {
         if (try? Options(invalid)) != nil { throw CLIError("accepted invalid options: \(invalid)") }
+    }
+    guard Set((0..<14).map { soakPayload($0).count }) == Set([0,1,2,3,4,5,7,16,20,23,31,32,63,64]),
+          soakPayload(13) != soakPayload(27),
+          try Options(["probe", "--phy", "2m", "--duration", "30", "--timeout", "50"]).duration == 30 else {
+        throw CLIError("soak payload/options failed")
+    }
+    for invalid in [["probe", "--duration", "30", "--timeout", "50"], ["probe", "--phy", "2m", "--duration", "30"], ["probe", "--phy", "1m,2m", "--duration", "30", "--timeout", "50"]] {
+        if (try? Options(invalid)) != nil { throw CLIError("accepted invalid soak options") }
     }
     emit("self_test", ["passed": true])
 }

@@ -109,3 +109,50 @@ a different identifier to that identity. The option defaults to OFF; use
 is fresh service discovery during schema changes, not PHY selection. This
 workaround is not evidence that the public-address firmware lacks the new service.
 Coded PHY is disabled and is not accepted by `--phy`.
+
+## Reliability runs
+
+One continuous connection at a fixed PHY (duration begins after PHY confirmation):
+
+```sh
+tools/macos-ble/ble.sh probe --phy 1m --duration 1800 --timeout 1830
+```
+
+Without `--write-hex`, each round uses a changing payload, cycling lengths
+0,1,2,3,4,5,7,16,20,23,31,32,63,64. Every round reads uptime, writes echo,
+checks exact readback and confirms the PHY; uptime must never move backwards.
+A read/write error, mismatch, unexpected disconnect or ten seconds without
+callback progress fails immediately. `--interval` is the pause between rounds
+(default 0.2 seconds); it is not a per-operation timeout. `--write-hex` can select
+a fixed payload instead. Completion requires a whole verified round at or after
+`--duration`; a global timeout is a failure, never a successful soak result.
+The final summary includes completed rounds, verified bytes, elapsed soak time
+and the maximum observed round duration.
+
+The Python wrapper runs 30 resets, 100 reconnects (alternating 1M/2M) and a separate
+30-minute continuous connection at each PHY. It does not require Python packages:
+
+```sh
+python3 tools/macos-ble/reliability.py
+
+# Run an individual phase or adjust the run length.
+python3 tools/macos-ble/reliability.py --phase resets --resets 30
+python3 tools/macos-ble/reliability.py --phase reconnect --reconnects 100
+python3 tools/macos-ble/reliability.py --phase soak --duration 1800
+python3 tools/macos-ble/reliability.py --phase soak --phys 2m --duration 1200
+```
+
+Results are saved under `.build/reliability-<UTC timestamp>/`: `report.json`
+records each case, firmware ELF hash, revision, working changes and client source
+hash (and the runner source hash in current versions); raw JSONL logs preserve every callback. Each reset/reconnect case writes
+and verifies one payload (lengths 0,1,3,20,63,64). This tests software reset through
+probe-rs, not a physical power cycle. The wrapper stops on the first failure;
+there is no automatic retry that can turn a failed case into a pass.
+
+After a failure it uses probe-rs GDB plus `/tmp/gdb-wch-fixed` (override with
+`--gdb`) to save registers/diagnostics and 64KB RAM. The core stays halted to
+preserve evidence; finish diagnosis and reset before the next run. GDB is never
+attached while a successful continuous-link test is running. Use `--id` to select
+the exact board if multiple devices use the same name. The wrapper uses `caffeinate` while it runs to prevent idle sleep, without changing
+Bluetooth or power settings. Only one process should control the probe/client
+during a run.
