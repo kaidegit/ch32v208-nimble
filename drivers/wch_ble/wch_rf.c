@@ -309,10 +309,11 @@ set_phy_tx_mode(uint8_t phy, uint8_t payload_len)
 static void
 set_phy_rx_mode(uint8_t phy)
 {
-    /* Vendor BLE_SetPHYRxMode 0x137c2..1382c; BYTE offsets. */
-    WCH_REG32(WCH_BB_BASE, 0x20) = phy == 2 ? 0x00090086UL : 0x00090083UL;
-    WCH_REG32(WCH_BB_BASE, 0x14) = phy == 2 ? 0x08301ff1UL : 0x08101901UL;
-    WCH_REG32(WCH_BB_BASE, 0x18) = phy == 2 ? 0x00031619UL : 0x00031624UL;
+    /* Vendor enum0=1M/enum1=2M share this group (0x137c2..1382c).
+     * The (enum & 2) branch at0x13748 is coded PHY, unsupported here. */
+    WCH_REG32(WCH_BB_BASE, 0x20) = 0x00090083UL;
+    WCH_REG32(WCH_BB_BASE, 0x14) = 0x08101901UL;
+    WCH_REG32(WCH_BB_BASE, 0x18) = 0x00031624UL;
     WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
                     (phy == 2 ? WCH_BB_RFCTRL_PHY_2M : WCH_BB_RFCTRL_PHY_1M);
     WCH_REG32(WCH_BB_BASE, 0x28) = 0x28be;
@@ -719,7 +720,9 @@ wch_rf_bb_isr(void)
         if (s_rx_armed && !s_rx_progress) {
             s_rx_progress = true;
             /* Address match closes WFR, then allow the entire PDU. */
-            WCH_LLE_WINDOW = 16U * (255U + 10U) + 100U;
+            /* BLE_SetPHYRxMode 0x13808..0x1382c: (max+5)*
+             * (1M:16, 2M:8)+60 half-us after address capture. */
+            WCH_LLE_WINDOW = (s_phy_rx == 2 ? 8U : 16U) * (255U + 5U) + 60U;
             notify(WCH_RF_EVT_RX_START, s_last_anchor);
         }
     }

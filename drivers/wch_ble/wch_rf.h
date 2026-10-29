@@ -48,7 +48,6 @@ extern "C" {
  *   bit6    whitening disabled
  *   bit7    "shut" state
  *   bit8    direction (both TX and RX sequences set (b&~0x180)|0x100)
- *   bit23   TX trigger (ll_tx_wait_finish: BB[0]|=0x800000)
  *   [13:12] PHY mode (01=1M, 00=2M; vendor enum0/1)
  *   bit23   TX trigger (RF_Tx final step: BB[0x00]|=0x800000, RE §4.6)
  *   bit29   CTE enable (not used here)
@@ -322,7 +321,7 @@ extern "C" {
 #define WCH_RFEND_TUNE_CO_MASK      0x0000003FUL
 #define WCH_RFEND_TUNE_GA       (WCH_REG32(WCH_RFEND_BASE, 0x94))
 #define WCH_RFEND_TUNE_GA_SHIFT     10
-#define WCH_RFEND_TUNE_GA_MASK      0x0000003FUL
+#define WCH_RFEND_TUNE_GA_MASK      0x0000007FUL
 
 /* RFEND +0x9C: bit8 = RX filter measure ready, bits[4:0] = value (RE §6.2) */
 #define WCH_RFEND_FILTMEAS      (WCH_REG32(WCH_RFEND_BASE, 0x9C))
