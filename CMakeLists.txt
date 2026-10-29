@@ -130,6 +130,7 @@ target_link_libraries(nimble_core PUBLIC freertos_kernel)
 # Register-level RF/BB/LLE/AES driver + NimBLE PHY/HW adaptation + timer port.
 add_library(wch_ble STATIC
     drivers/wch_ble/wch_rf.c
+    drivers/wch_ble/wch_rf_analog.c
     drivers/wch_ble/ble_phy_wch.c
     drivers/wch_ble/ble_hw_wch.c
     port/hal_timer_wch.c

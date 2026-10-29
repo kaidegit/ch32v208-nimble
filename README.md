@@ -6,6 +6,12 @@
 `LOADADDR(.data)`、直接链接 syscalls 和 `PFIC_GISR.GACTSTA`。
 下方调试历史中的 HPE/异步写内存/EHMOD 等旧推断应对照此记录阅读。
 
+射频修正和空口实测另见 [射频复核记录](docs/radio-2026-10-29.md)。
+当前实测：55秒运行无异常/断言；Mac连续40秒扫描收到82条目标广播。
+连接/GATT仍在验证，尚不能声称通过。
+macOS 测试客户端见 [tools/macos-ble](tools/macos-ble/README.md)。
+旧逆向笔记和下方历史表包含已推翻的寄存器解释，新增驱动修改必须核对原厂指令。
+
 **项目定位**：用 Apache NimBLE（controller + host 全开源）直接驱动 CH32V208 的蓝牙硬件，验证/测试该芯片的 BLE 功能。RF/BB/LLE 寄存器级驱动逆向自 WCH 闭源库 `libwchble.a`（见 [WCH_BLE_LIB_RE_FINDINGS.md](../../WCH_BLE_LIB_RE_FINDINGS.md)），**不用 WCH 闭源协议栈、不用 TMOS**。CMake 构建，FreeRTOS + NimBLE NPL(freertos)，probe-rs + WCH-LinkE + SEGGER RTT 日志。
 
 ## 架构
@@ -87,7 +93,7 @@ probe-rs debug --chip CH32V208WBU6 build/ch32v208_nimble.elf \
 | 阶段 | 内容 | 怎么算过 |
 |---|---|---|
 | **S0** | boot 路径：startup→时钟→FreeRTOS→RTT banner（`boot` 目标） | `scripts/run.sh` 能看到 RTT 输出 startup/时钟/任务启动 banner，无 HardFault；gdb attach 可停在 main |
-| **S1** | RF 基础：`wch_rf_init`、RFEND TXCtune 三频点校准日志、空闲 RSSI 读数（BB[0xC0] bits[22:15]） | 校准日志给出低/中/高三频点 tCtune 值且逐次上电一致；屏蔽罩下读 RSSI 为饱和负值，靠近 2.4G 干扰源数值变化 |
+| **S1** | RF 基础：`wch_rf_init`、RFEND TXCtune 三频点校准日志、空闲 RSSI 读数（BB+0x30 bits[22:15]） | 校准日志给出低/中/高三频点 tCtune 值且逐次上电一致；屏蔽罩下读 RSSI 为饱和负值，靠近 2.4G 干扰源数值变化 |
 | **S2** | DTM 发射：HCI_LE_Transmitter_Test（经 host HCI 或直接调 RF 原语定频发射） | nRF Connect/频谱仪在指定信道看到稳定载波/调制包；功率与频偏在 CH32V208 规格内（数据手册典型值） |
 | **S3** | legacy 广播：本工程固件上电广播 "CH32V208-NIMBLE" | 手机 nRF Connect 扫描到设备名与厂商字段（0xFF, 'W','C'）；`ble_gap_adv_start` 无错误返回；可被连接 |
 | **S4** | GATT + MTU：连接后交换 MTU，读 uptime 特征、写 echo 特征 | 连接日志打印 conn itvl/latency/timeout；MTU 事件打印（≥23）；读回 4 字节 uptime 递增；写任意 hex 后 RTT 打印 hex dump 且回读一致；断开后自动恢复广播 |
@@ -95,26 +101,21 @@ probe-rs debug --chip CH32V208WBU6 build/ch32v208_nimble.elf \
 
 ## 寄存器速查（BB/LLE/RFEND/AES）
 
-来源：逆向文档 [WCH_BLE_LIB_RE_FINDINGS.md](../../WCH_BLE_LIB_RE_FINDINGS.md)（下表注明对应章节）。基址：BB `0x40024100`、LLE `0x40024200`、RFEND `0x40025000`、AES `0x40024300`（§3）。
+以下为本轮核对原厂指令的字节偏移；完整依据见射频复核记录。
 
-| 域 | 偏移 | 含义 | 出处 |
-|---|---|---|---|
-| BB[0x00] | bits[5:0] | 信道号 | §4.2 |
-| BB[0x00] | bit6 / bit7 / bit8 / bit11 | 白化关 / shut 态 / TX-RX 方向 / 发射触发前置 | §4.2 |
-| BB[0x00] | bits[13:12] | PHY 选择（1M/2M/coded 组合） | §4.2、§4.4 |
-| BB[0x1C/0x20/0x24/0x28/0x10/0x14] | — | RX 解调器/ADC 时序组（1M/2M 各一组魔数） | §4.4 |
-| BB[0x2C] | bits[1:0] | RX arm（bit0=1 收完自动回 ack）/ TX arm | §4.8 |
-| BB[0xC0] | bits[22:15] | RSSI（有符号，`BLE_ReadRssi = (int8)(BB[0xC0]>>15)`） | §4.9 |
-| LLE[0x00] | =2 / =8 | 启动 TX / shut | §4.3 |
-| LLE[0x08/0x0C] | — | TX 模式字 / 状态屏蔽（复位值 0xFFFF/0xF00F） | §3.2、§4.4 |
-| LLE[0x14..0x4C] | 每 8B 一组 | 各 PDU 类型超时/窗口基准（单位=LLE tick，**待实测**） | §3.2 |
-| LLE[0x1C] / LLE[0x64] | — | RX 等待超时 / TX 完成自旋计数（**单位待实测**） | §3.2、§4.3 |
-| LLE[0x74] | — | RX 帧缓冲指针（→ gBleIPPara+0x24） | §3.2 |
-| RFEND[0x2C] | bit1 | 频率模式（0=信道号，1=频率直写） | §4.2 |
-| RFEND[0x44] | bits[24:20] / bits[17:0] | 合成器整数/小数分频（f=64 MHz×(int+frac/2^18)，低本振注入 −1 MHz@1M / −2 MHz@2M） | §4.2 |
-| RFEND[0x48/0x4C] | — | 模拟前端基准位域（DevInit 魔数序列，原样复刻） | §3.3 |
-| RFEND[40(0x28)] | =1152 | Reset 后基准值 | §3.3 |
-| AES@0x40024300 | — | 硬件 AES-128（CCM 包加密的密码原语，SM 用） | §9.7、§13.1 |
+| 寄存器 | 已核实含义 |
+| --- | --- |
+| BB+0x00 bits13:12 | 1M=0x1000，2M=0；bits5:0为BLE信道 |
+| BB+0x2c bits30:25 | TX功率枚举，0dBm=9 |
+| BB+0x30 | RSSI bits22:15 |
+| BB+0x38 | 状态；bit5为CRC错误；bit4/7不能作为RX超时判断 |
+| LLE+0x04 bit0 | basic/auto sequencer选择，完成状态含义随模式变化 |
+| LLE+0x08 / +0x0c | W1C状态 / 中断屏蔽；basic RX done=1，TX done=2 |
+| LLE+0x14 | 初始化0x8c；模式字位于+0x50 |
+| LLE+0x50 | TX=0x5a、RX=0x59、校准=0x5d |
+| LLE+0x64 | 半微秒窗口倒计时；归零不能证明TX成功 |
+| LLE+0x70 / +0x74 | 独立TX/RX DMA直接地址；RX需272字节对齐缓冲 |
+| RFEND+0x2c bit1 | BLE路径清零，使用自动信道合成 |
 
 ## 上板调试记录（2026-10-28 bring-up）
 

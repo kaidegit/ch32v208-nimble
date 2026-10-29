@@ -452,7 +452,9 @@ wch_ble_hw_init(void)
     HW_TRACE(6);
     console_printf("hw: rf_init\n");
     HW_TRACE(7);
-    (void)wch_rf_init();
+    int rf_rc = wch_rf_init();
+    console_printf("hw: rf_init rc=%d\n", rf_rc);
+    configASSERT(rf_rc == 0);
     HW_TRACE(8);
     app_dbg_chk("hw:rf");
     HW_TRACE(9);

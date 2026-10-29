@@ -225,6 +225,18 @@ app_ble_advertise(void)
         return;
     }
 
+    /* Repeat the complete name in scan response. In active scans macOS can
+     * retain the previous firmware's response name for the same public MAC. */
+    memset(&fields, 0, sizeof fields);
+    fields.name = (const uint8_t *)name;
+    fields.name_len = strlen(name);
+    fields.name_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&fields);
+    if (rc != 0) {
+        console_printf("adv: set scan response failed rc=%d\n", rc);
+        return;
+    }
+
     memset(&adv_params, 0, sizeof adv_params);
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;

@@ -22,7 +22,9 @@ Connect from another terminal:
 
     ${GDB} build/ch32v208_nimble.elf \\
         -ex 'target remote localhost:3333' \\
-        -ex 'monitor reset halt'
+        -ex 'set \$sp=0x20010000' \\
+        -ex 'set \$pc=0x08000000' \\
+        -ex continue
 
 Add source dir lookup if needed:
     directory \$(pwd)

@@ -48,57 +48,43 @@ extern "C" {
  *   bit6    whitening disabled
  *   bit7    "shut" state
  *   bit8    direction (both TX and RX sequences set (b&~0x180)|0x100)
- *   bit11   TX pre-trigger (ll_tx_wait_finish: BB[0]|=0x800, RE §4.3)
- *   [13:12] PHY mode (00=1M, 10=2M, RE §4.4)
+ *   bit23   TX trigger (ll_tx_wait_finish: BB[0]|=0x800000)
+ *   [13:12] PHY mode (01=1M, 00=2M; vendor enum0/1)
  *   bit23   TX trigger (RF_Tx final step: BB[0x00]|=0x800000, RE §4.6)
  *   bit29   CTE enable (not used here)
- *   bit31   set by BB_DevInit (RE §3.1)
+ *   bit28   set by BB_DevInit (0x10000000)
  */
 #define WCH_BB_RFCTRL           (WCH_REG32(WCH_BB_BASE, 0x00))
-#define WCH_BB_RFCTRL_CH_MASK       0x0000007FUL
+#define WCH_BB_RFCTRL_CH_MASK       0x0000003FUL
 #define WCH_BB_RFCTRL_WHITEN_OFF    0x00000040UL
 #define WCH_BB_RFCTRL_SHUT          0x00000080UL
 #define WCH_BB_RFCTRL_DIR_RX        0x00000100UL
 #define WCH_BB_RFCTRL_DIR_MASK      0x00000180UL
-#define WCH_BB_RFCTRL_TX_PRETRIG    0x00000800UL
+#define WCH_BB_RFCTRL_TX_PRETRIG    0x00800000UL
 #define WCH_BB_RFCTRL_PHY_MASK      0x00003000UL
-#define WCH_BB_RFCTRL_PHY_2M        0x00002000UL    /* RE §4.4 */
+#define WCH_BB_RFCTRL_PHY_1M        0x00001000UL
+#define WCH_BB_RFCTRL_PHY_2M        0x00000000UL    /* RE §4.4 */
 #define WCH_BB_RFCTRL_TX_TRIG       0x00800000UL    /* bit23 - RE §4.6 */
 
 /* BB +0x04 = CRC init value; BB +0x08 = access address (RE §4.6/§4.7/§12.6) */
 #define WCH_BB_CRCINIT          (WCH_REG32(WCH_BB_BASE, 0x04))
 #define WCH_BB_ACCESSADDR       (WCH_REG32(WCH_BB_BASE, 0x08))
 
-/*
- * RX demodulator / ADC timing group programmed by BLE_SetPHYRxMode (RE §4.4).
- * 1M: 0x20=0x08101901 0x24=0x00031619 0x1C=0x00090083 (0x90086 for 2M)
- *     0x28=0x000028DE 0x10=0x01006310 0x14=0x003FA4DF (0x0034A4DF when dtmFlag)
- * 2M: 0x20=0x08301FF1 0x24=0x00031624
- */
+/* RX group byte offsets verified in BLE_SetPHYRxMode 0x137c2..1382c.
+ * 1M: +10=0x3222D0 (+10=0x3FA2CE in DTM), +14=0x08101901,
+ * +18=0x31624, +20=0x90083, +24=0x01006310, +28=0x28BE. */
 #define WCH_BB_RXCFG10          (WCH_REG32(WCH_BB_BASE, 0x10))
 #define WCH_BB_RXCFG14          (WCH_REG32(WCH_BB_BASE, 0x14))
-#define WCH_BB_RXCFG1C          (WCH_REG32(WCH_BB_BASE, 0x1C))
+#define WCH_BB_RXCFG18          (WCH_REG32(WCH_BB_BASE, 0x18))
 #define WCH_BB_RXCFG20          (WCH_REG32(WCH_BB_BASE, 0x20))
 #define WCH_BB_RXCFG24          (WCH_REG32(WCH_BB_BASE, 0x24))
 #define WCH_BB_RXCFG28          (WCH_REG32(WCH_BB_BASE, 0x28))
-
-#define WCH_BB_RX_1M_CFG10      0x01006310UL    /* RE §4.4 */
-#define WCH_BB_RX_1M_CFG20      0x08101901UL    /* RE §4.4 */
-#define WCH_BB_RX_1M_CFG24      0x00031619UL    /* RE §4.4 */
-#define WCH_BB_RX_1M_CFG1C      0x00090083UL    /* RE §4.4 */
-#define WCH_BB_RX_2M_CFG20      0x08301FF1UL    /* RE §4.4 */
-#define WCH_BB_RX_2M_CFG24      0x00031624UL    /* RE §4.4 */
-#define WCH_BB_RX_2M_CFG1C      0x00090086UL    /* RE §4.4 */
-#define WCH_BB_RX_CFG28         0x000028DEUL    /* RE §4.4 */
-#define WCH_BB_RX_CFG14_NORMAL  0x003FA4DFUL    /* RE §4.4 */
-#define WCH_BB_RX_CFG14_DTM     0x0034A4DFUL    /* RE §4.4 (dtmFlag set)   */
 
 /*
  * BB +0x2C:
  *   [1:0]  RX arm / auto-ack control: |=1 arms RX after TX (auto ack),
  *          &=~3 clears (RE §3.1, §4.6, §5.3)
- *   [30:25] cfg word (sleep clock accuracy, RE §3.1; connection mode stores
- *          the RF frequency word here, RE §12.1 step 4)
+ *   [30:25] TX power enum (LL_SetTxPowerLevel 0x348c; 0 dBm = enum 9).
  */
 #define WCH_BB_AUTOCFG          (WCH_REG32(WCH_BB_BASE, 0x2C))
 #define WCH_BB_AUTOCFG_ARM_MASK     0x00000003UL
@@ -114,19 +100,14 @@ extern "C" {
  * BB +0x38 = IRQ status register (RE §5.2). Write the bit's clear-value to
  * acknowledge: bit6 <- 0x60, bit4 <- 0x10, bit7 <- 0x80.
  *   bit6: clock capture / sleep timing event (connection anchor capture)
- *   bit4: error/timeout
- *   bit7: error/timeout
+ *   bit4/bit7: vendor acknowledges and sets a timer flag; not RX verdicts.
  */
 #define WCH_BB_IRQSTAT          (WCH_REG32(WCH_BB_BASE, 0x38))
 #define WCH_BB_IRQSTAT_CLKCAP       0x00000040UL
 #define WCH_BB_IRQSTAT_CLKCAP_CLR   0x00000060UL
-#define WCH_BB_IRQSTAT_ERR          0x00000010UL
-#define WCH_BB_IRQSTAT_ERR_CLR      0x00000010UL
-#define WCH_BB_IRQSTAT_ERR2         0x00000080UL
-#define WCH_BB_IRQSTAT_ERR2_CLR     0x00000080UL
 
-/* BB +0xC0: bits[22:15] signed RSSI, bits[15:5] signed 11-bit CFO (RE §4.9) */
-#define WCH_BB_RSSICFO          (WCH_REG32(WCH_BB_BASE, 0xC0))
+/* BB +0x30: bits[22:15] signed RSSI, bits[15:5] signed 11-bit CFO (RE §4.9) */
+#define WCH_BB_RSSICFO          (WCH_REG32(WCH_BB_BASE, 0x30))
 #define WCH_BB_RSSI_SHIFT           15
 #define WCH_BB_CFO_SHIFT            5
 
@@ -147,34 +128,25 @@ extern "C" {
 
 /*
  * LLE +0x04: in basic/advertise mode bit0 carries the LLEMode auto-ack bit
- * (RE §4.6/§4.7: LLE[0x04]=(LLE[0x04]&~1)|(rfConfig&1)); in connection mode
- * this register holds CRCInit|1 (RE §12.1 step 5).
+ * (vendor RF_Tx/RF_Rx: LLE[0x04]=(LLE[0x04]&~1)|(rfConfig&1)).
+ * Other fields are not established by the basic-mode audit.
  */
 #define WCH_LLE_CRC_AA_CFG      (WCH_REG32(WCH_LLE_BASE, 0x04))
 
-/*
- * LLE +0x08 = IRQ status, write the bit's own value to clear (RE §5.3):
- *   bit0  -> write 1        bit1 (RX done)   -> write 2
- *   bit2  (TX done) -> write 4 AND program LLE[0x1C] turnaround first
- *   bit3  -> write 8        bit12 -> 0x1000, bit13 -> 0x2000, bit15 -> 0x8000
- *   bit14 (tick) -> write 0x40000 and LLE[0x68]=0xFFFFFFFF
- * BLE_SetPHYTxMode also writes 2 here to clear a stale TX-done (RE §4.4),
- * and RF_Rx writes 0x2000 before arming (RE §4.7).
- */
+/* LLE +0x08 W1C status; BASIC stages: bit0 RX done, bit1 TX done.
+ * Auto sequencer meanings differ (vendor LLE_IRQSubHandler 0x33840).
+ * Bit13=window expiry, bit14=clock tick. */
 #define WCH_LLE_IRQSTAT         (WCH_REG32(WCH_LLE_BASE, 0x08))
-#define WCH_LLE_IRQ_RX_DONE         0x00000002UL
-#define WCH_LLE_IRQ_TX_DONE         0x00000004UL
-#define WCH_LLE_IRQ_TICK_CLR        0x00040000UL
+#define WCH_LLE_IRQ_RX_DONE         0x00000001UL
+#define WCH_LLE_IRQ_TX_DONE         0x00000002UL
+#define WCH_LLE_IRQ_TICK_CLR        0x00004000UL
 #define WCH_LLE_IRQ_CLEAR_RX        0x00002000UL    /* pre-arm clear - RE §4.7 */
-#define WCH_LLE_IRQ_CLEAR_TX        0x00000002UL    /* pre-tx clear  - RE §4.4 */
+#define WCH_LLE_IRQ_CLEAR_TX        0x00002000UL    /* pre-tx clear  - RE §4.4 */
 
 /* LLE +0x0C == guard word 0x4002420C (see WCH_RF_GUARD_REG) */
 
-/*
- * LLE +0x14 = per-mode timeout / window compare value (RE §3.2/§4.6/§4.7):
- *   init 0x8C, TX 0x5A, RX 0x59, calibration 93 (0x5D), 0 at shutdown.
- * bits[2:0] are cleared before a force stop (RE §4.3/§12.1).
- */
+/* LLE +0x14 is initialized to0x8C; it is not the mode register.
+ * TX/RX/calibration mode values below are written to +0x50. */
 #define WCH_LLE_TIMEOUT         (WCH_REG32(WCH_LLE_BASE, 0x14))
 #define WCH_LLE_TIMEOUT_MASK        0x00000007UL
 #define WCH_LLE_TIMEOUT_TX          0x5AUL      /* RE §4.6 */
@@ -227,10 +199,10 @@ extern "C" {
 #define WCH_LLE_TICK            (WCH_REG32(WCH_LLE_BASE, 0x68))
 #define WCH_LLE_CALLOAD         (WCH_REG32(WCH_LLE_BASE, 0x6C))
 
-/* LLE +0x70 = TX/RX frame DMA buffer pointer (RE §4.6/§4.7/§12.6/§12.9) */
+/* LLE +0x70 = direct TX frame DMA address; RX has separate +0x74. */
 #define WCH_LLE_FRAMEPTR        (WCH_REG32(WCH_LLE_BASE, 0x70))
-/* LLE +0x74 = pointer to the shared RX-frame-pointer variable (RE §3.2) */
-#define WCH_LLE_RXBUFPTR_VAR    (WCH_REG32(WCH_LLE_BASE, 0x74))
+/* LLE +0x74 = direct RX DMA buffer address (vendor 0x13f22..13f2a,0x281c4). */
+#define WCH_LLE_RXBUFPTR    (WCH_REG32(WCH_LLE_BASE, 0x74))
 
 /* ------------------------------------------------------------------------- */
 /* AES registers (RE §9.7 single-block ECB, §12.5 packet CCM handover)       */
@@ -350,7 +322,7 @@ extern "C" {
 #define WCH_RFEND_TUNE_CO_MASK      0x0000003FUL
 #define WCH_RFEND_TUNE_GA       (WCH_REG32(WCH_RFEND_BASE, 0x94))
 #define WCH_RFEND_TUNE_GA_SHIFT     10
-#define WCH_RFEND_TUNE_GA_MASK      0x0000007FUL
+#define WCH_RFEND_TUNE_GA_MASK      0x0000003FUL
 
 /* RFEND +0x9C: bit8 = RX filter measure ready, bits[4:0] = value (RE §6.2) */
 #define WCH_RFEND_FILTMEAS      (WCH_REG32(WCH_RFEND_BASE, 0x9C))
@@ -396,8 +368,11 @@ extern struct wch_rf_timing g_wch_rf_timing;
 /* Events / callback                                                         */
 /* ------------------------------------------------------------------------- */
 
+#define WCH_RF_RX_BUFFER_SIZE 272U
+
 enum wch_rf_event {
     WCH_RF_EVT_TX_DONE = 0,     /* payload = frame end cputime */
+    WCH_RF_EVT_RX_START,        /* payload = address-match cputime */
     WCH_RF_EVT_RX_DONE,         /* payload = frame end cputime */
     WCH_RF_EVT_RX_TIMEOUT,      /* payload = 0 */
     WCH_RF_EVT_HW_ERR           /* payload = raw status word */
@@ -405,6 +380,7 @@ enum wch_rf_event {
 
 typedef void (*wch_rf_cb_t)(enum wch_rf_event evt, uint32_t payload);
 void wch_rf_set_callback(wch_rf_cb_t cb);
+bool wch_rf_rx_crc_ok(void);
 
 /* ------------------------------------------------------------------------- */
 /* API                                                                       */
@@ -415,7 +391,7 @@ void wch_rf_set_callback(wch_rf_cb_t cb);
  *   HSE load trim (3 lines from WCHBLE_Init, EXAM/BLE/HAL/MCU.c) ->
  *   LLE_DevInit -> RFEND_DevInit -> BB_DevInit ->
  *   TXCtune(3 points + 39ch interpolation) -> TXFtune -> RXFilter -> RXAdc ->
- *   SetSensitivity -> NVIC: BB=1, LLE=1.
+ *   NVIC: BB=1, LLE=1.
  * Also performs the one-shot entropy/RNG seeding hook used by ble_hw_wch.c.
  */
 int  wch_rf_init(void);
@@ -424,7 +400,7 @@ int  wch_rf_init(void);
 void wch_rf_recalibrate(void);
 
 /*
- * Set BLE channel, RE §4.2.  ble_chan: 0..36 data (2404+2*chan MHz),
+ * Set BLE channel, RE §4.2.  ble_chan: 0..36 data (skip advertising 2426 MHz),
  * 37/38/39 advertising (2402/2426/2480 MHz).  Frequency mode (RFEND[0x2C]|=2)
  * with low-side LO injection (-1 MHz @1M, -2 MHz @2M).
  */
@@ -437,7 +413,7 @@ uint8_t wch_rf_channel_get(void);
  * Basic transmit, RE §4.6 (no auto-ack).  Frame layout
  *   [0] = PDU header byte, [1] = payload length, [2..] = payload
  * (this is exactly the lib's [pktTxType][txLen][data] frame).  Blocks until
- * LLE[0x64] busy flag clears or timeout_half_us elapses (0.5 us units).
+ * actual basic TX-done status (bit1) or a bounded deadline.
  * Returns 0 on success, -1 on timeout / busy.
  */
 int  wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us);
@@ -459,7 +435,7 @@ int  wch_rf_arm_auto_ack(const uint8_t *rsp, uint16_t n);
 /* Shutdown sequence, RE §4.3 ble_ll_hw_api_shut */
 void wch_rf_shut(void);
 
-/* RSSI of the last frame, RE §4.9: (int8_t)(BB[0xC0] >> 15) */
+/* RSSI of the last frame, RE §4.9: (int8_t)(BB[0x30] >> 15) */
 int8_t wch_rf_rssi(void);
 
 /* CFO of the last frame (Hz-approx, signed 11-bit @15.625 kHz/LSB), RE §4.9 */

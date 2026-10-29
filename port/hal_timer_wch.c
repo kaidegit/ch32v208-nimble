@@ -101,27 +101,25 @@ wch_timer_input_freq(void)
     }
 }
 
-/* Consistent 32-bit read: high word, CNT, high word again (overflow race). */
+/* Consume pending overflow under the same IRQ lock as the ISR. PHY start
+ * waits can run with IRQs masked, including across a 16-bit wrap. Merely
+ * reading high/CNT/high then relies on an ISR that cannot run and can leave
+ * the caller waiting forever for a deadline in the next 65536 us epoch.
+ * Polling here also supports more than one wrap during a masked busy wait,
+ * provided consecutive reads are less than one hardware period apart. */
 static uint32_t
 wch_timer_read32(void)
 {
-    uint32_t hi, cnt, hi2;
-
-    hi = g_wch_timer.high_word;
-    cnt = TIM3->CNT;
-    hi2 = g_wch_timer.high_word;
-    if (hi2 != hi) {
-        /* Wrapped while reading: use the newer high word with a re-read
-         * CNT; if CNT is small the sample belongs after the wrap. */
+    uint32_t sr = wch_irq_lock();
+    uint32_t hi = g_wch_timer.high_word;
+    uint32_t cnt = TIM3->CNT;
+    if (TIM3->INTFR & TIM_UIF) {
+        TIM3->INTFR = (uint16_t)~TIM_UIF;
+        hi = ++g_wch_timer.high_word;
         cnt = TIM3->CNT;
-        hi = hi2;
-        if (cnt < 0x8000u) {
-            hi = hi2;
-        } else {
-            hi = hi2 - 1;
-        }
     }
-    return (hi << 16) | (cnt & 0xFFFFu);
+    wch_irq_unlock(sr);
+    return (hi << 16) | (cnt & 0xffffU);
 }
 
 /* Program CH1 compare for 'expiry' and (re)arm CC1IF interrupt.
@@ -190,8 +188,9 @@ hal_timer_wch_irq(void)
 
     if (intfr & TIM_CC1IF) {
         TIM3->INTFR = (uint16_t)~TIM_CC1IF;
-        wch_timer_chk_queue();
     }
+    /* A past-due deadline pends PFIC without creating a compare flag. */
+    wch_timer_chk_queue();
 }
 
 /* ---------------------------------------------------------- hal_timer API */

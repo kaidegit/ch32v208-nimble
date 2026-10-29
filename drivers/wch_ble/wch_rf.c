@@ -1,9 +1,8 @@
 /*
  * wch_rf.c - WCH CH32V208 BLE baseband / LLE / RF-AFE register level driver.
  *
- * Every sequence is a faithful transcription of the reverse-engineered
- * libwchble.a programming model documented in
- * WCH_BLE_LIB_RE_FINDINGS.md (referenced as "RE §x.y" below).
+ * Corrected sequences cite verified vendor ELF instructions. Inherited RE
+ * notes remain pointers for unvalidated features, not register authority.
  *
  * Time source: os_cputime_get32() only (1 MHz, provided by the platform
  * hal_timer on TIM3).  This driver never touches TIM3 itself.
@@ -53,9 +52,14 @@ static bool     s_whiten_off;           /* NimBLE always whitens -> false     */
 static bool     s_encrypt;              /* CCM enabled -> LLE[0x50] bit5      */
 static bool     s_dtm;                  /* demod cfg14 variant - RE §4.4      */
 static bool     s_auto_arm_rx;          /* TX->RX T_IFS continuation flag     */
+static bool     s_rx_crc_ok;
+static bool s_rx_progress;
+volatile uint32_t g_wch_rf_tx_elapsed_us[16];
+volatile uint8_t g_wch_rf_tx_payload_len[16];
 static bool     s_rx_armed;             /* engine waiting for a frame         */
 
-static uint8_t *s_rxbuf;                /* RX frame buffer (header first)     */
+static uint8_t s_rx_dma[WCH_RF_RX_BUFFER_SIZE] __attribute__((aligned(4)));
+static uint8_t *s_rxbuf = s_rx_dma; /* direct hardware RX destination */
 static uint8_t  s_last_rx_len;          /* len byte of last RX (RE §5.3)      */
 static uint32_t s_last_anchor;          /* cputime @ clock-capture event      */
 
@@ -131,7 +135,7 @@ static uint32_t
 freq_for_channel(uint8_t ch)
 {
     if (ch <= 36) {
-        return (2404UL + 2UL * ch) * 1000UL;        /* data channels      */
+        return ((ch <= 10 ? 2404UL : 2406UL) + 2UL * ch) * 1000UL;        /* data channels      */
     }
     switch (ch) {
     case 37: return 2402000UL;                      /* advertising 37     */
@@ -141,20 +145,6 @@ freq_for_channel(uint8_t ch)
     }
 }
 
-/* RFEND[0x44] synthesizer programming - RE §4.2 core formula. */
-static void
-synth_program(uint32_t f_khz)
-{
-    uint32_t v;
-
-    v = WCH_RFEND_SYNTH;
-    v = (v & WCH_RFEND_SYNTH_INT_MASK) |
-        (((f_khz / 64000UL) & 0x1FUL) << WCH_RFEND_SYNTH_INT_SHIFT);
-    v = (v & WCH_RFEND_SYNTH_FRAC_MASK) |
-        ((((f_khz % 64000UL) << 10) / 250UL) & WCH_RFEND_SYNTH_FRAC_MAX);
-    WCH_RFEND_SYNTH = v;
-}
-
 static uint16_t
 lo_inject_for_phy(uint8_t phy)
 {
@@ -162,28 +152,18 @@ lo_inject_for_phy(uint8_t phy)
                       : g_wch_rf_timing.lo_inject_khz_1m;
 }
 
-/*
- * RF_DevSetChannel(ch, mode=1) - RE §4.2 frequency mode path:
- *   BB[0x00][5:0] <- channel, RFEND[0x2C] |= 2, synth <- carrier - LO,
- *   bit6 <- whitening-off flag.
- */
+/* Standard BLE channel mode, matching ll_advertise_tx 0x17cb8..0x17cce.
+ * RF_DevSetChannel's explicit-frequency branch is for the proprietary RF API;
+ * BLE lets hardware derive the LO from the channel and PHY selection. */
 static void
 dev_set_channel(uint8_t ch, uint16_t lo_inject_khz)
 {
-    uint32_t f = freq_for_channel(ch);
-    uint32_t fs = (f > lo_inject_khz) ? (f - lo_inject_khz) : f;
-
-    WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_CH_MASK) |
-                    (ch & WCH_BB_RFCTRL_CH_MASK);
-    WCH_RFEND_FREQMODE |= WCH_RFEND_FREQMODE_EN;
-    synth_program(fs);
-    if (s_whiten_off) {
-        WCH_BB_RFCTRL |= WCH_BB_RFCTRL_WHITEN_OFF;
-    } else {
-        WCH_BB_RFCTRL &= ~WCH_BB_RFCTRL_WHITEN_OFF;
-    }
+    WCH_RFEND_FREQMODE &= ~WCH_RFEND_FREQMODE_EN;
+    WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~0x7fUL) |
+                    (ch & WCH_BB_RFCTRL_CH_MASK) |
+                    (s_whiten_off ? WCH_BB_RFCTRL_WHITEN_OFF : 0);
     s_channel = ch;
-    s_synth_khz = fs;
+    s_synth_khz = freq_for_channel(ch) - lo_inject_khz;
 }
 
 void
@@ -312,38 +292,32 @@ notify(enum wch_rf_event evt, uint32_t payload)
 /* ------------------------------------------------------------------------- */
 
 static void
-set_phy_tx_mode(uint8_t phy)
+set_phy_tx_mode(uint8_t phy, uint8_t payload_len)
 {
-    /* PA external control (gPaControl) unused - no external PA on this board. */
-    if (phy == 2) {
-        WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
-                        WCH_BB_RFCTRL_PHY_2M;
-    } else {
-        WCH_BB_RFCTRL &= ~WCH_BB_RFCTRL_PHY_MASK;       /* 1M - RE §4.4 */
-    }
-    /* LLE[0x0C] &= ~0x2000 (RE §4.4) omitted: LLE[0x0C] is the guard word,
-     * held at 0 inside a guard section (see wch_rf_guard_enter).           */
+    /* Vendor BLE_SetPHYTxMode 0x136dc..13712 (1M), 0x135fc..13638 (2M). */
+    WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
+                    (phy == 2 ? WCH_BB_RFCTRL_PHY_2M : WCH_BB_RFCTRL_PHY_1M);
+    uint32_t saved = WCH_RF_GUARD_REG;
+    WCH_RF_GUARD_REG = saved & ~0x2000UL;
+    __asm volatile("nop; nop" ::: "memory");
+    WCH_LLE_IRQSTAT = 0x2000;
+    WCH_LLE_WINDOW = phy == 2 ? 8UL * (payload_len + 11UL) + 316UL
+                              : 16UL * (payload_len + 10UL) + 316UL;
+    WCH_RF_GUARD_REG = saved;
 }
 
 static void
 set_phy_rx_mode(uint8_t phy)
 {
-    if (phy == 2) {
-        WCH_BB_RXCFG20 = WCH_BB_RX_2M_CFG20;            /* RE §4.4 */
-        WCH_BB_RXCFG24 = WCH_BB_RX_2M_CFG24;            /* RE §4.4 */
-        WCH_BB_RXCFG1C = WCH_BB_RX_2M_CFG1C;            /* RE §4.4 */
-        WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
-                        WCH_BB_RFCTRL_PHY_2M;
-    } else {
-        WCH_BB_RXCFG20 = WCH_BB_RX_1M_CFG20;            /* RE §4.4 */
-        WCH_BB_RXCFG24 = WCH_BB_RX_1M_CFG24;            /* RE §4.4 */
-        WCH_BB_RXCFG1C = WCH_BB_RX_1M_CFG1C;            /* RE §4.4 */
-        WCH_BB_RFCTRL &= ~WCH_BB_RFCTRL_PHY_MASK;       /* 1M       */
-    }
-    /* Common demodulator / ADC timing group - RE §4.4 */
-    WCH_BB_RXCFG28 = WCH_BB_RX_CFG28;
-    WCH_BB_RXCFG10 = WCH_BB_RX_1M_CFG10;
-    WCH_BB_RXCFG14 = s_dtm ? WCH_BB_RX_CFG14_DTM : WCH_BB_RX_CFG14_NORMAL;
+    /* Vendor BLE_SetPHYRxMode 0x137c2..1382c; BYTE offsets. */
+    WCH_REG32(WCH_BB_BASE, 0x20) = phy == 2 ? 0x00090086UL : 0x00090083UL;
+    WCH_REG32(WCH_BB_BASE, 0x14) = phy == 2 ? 0x08301ff1UL : 0x08101901UL;
+    WCH_REG32(WCH_BB_BASE, 0x18) = phy == 2 ? 0x00031619UL : 0x00031624UL;
+    WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
+                    (phy == 2 ? WCH_BB_RFCTRL_PHY_2M : WCH_BB_RFCTRL_PHY_1M);
+    WCH_REG32(WCH_BB_BASE, 0x28) = 0x28be;
+    WCH_REG32(WCH_BB_BASE, 0x24) = 0x01006310;
+    WCH_REG32(WCH_BB_BASE, 0x10) = s_dtm ? 0x003fa2ceUL : 0x003222d0UL;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -355,7 +329,6 @@ static void
 engine_stop(void)
 {
     WCH_LLE_MODE &= ~WCH_LLE_MODE_MASK;             /* LLE[0x50] &= ~7  §12.1 */
-    WCH_LLE_TIMEOUT &= ~WCH_LLE_TIMEOUT_MASK;       /* LLE[0x14] &= ~7  §4.3  */
     WCH_LLE_CMD |= WCH_LLE_CMD_FORCE_STOP;          /* LLE[0x00] |= 8   §4.3  */
     WCH_LLE_WINDOW = 0;
 }
@@ -370,145 +343,17 @@ wch_rf_shut(void)
     WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_DIR_MASK) |
                     WCH_BB_RFCTRL_SHUT;             /* (BB&~0x180)|0x80 */
     WCH_RFEND_FECTRL &= WCH_RFEND_FECTRL_SHUT;      /* &= 0xFFCDFFFF    */
-    WCH_LLE_TIMEOUT = 0;                            /* LLE[0x14] = 0    */
+    WCH_LLE_MODE = 0;
 
     s_rx_armed = false;
+    s_rx_progress = false;
     s_auto_arm_rx = false;
 
     wch_rf_guard_exit();
 }
 
-/* ------------------------------------------------------------------------- */
-/* Analog front end calibration (RE §6)                                      */
-/* ------------------------------------------------------------------------- */
-
-/*
- * RFEND_TXCtune - RE §6.1: measure VCO capacitor (CO) / gain (GA) at the
- * three band codes 0xBF/0xD3/0xE7 (2401/2440/2480 MHz), then interpolate a
- * 39-channel x 4-bit table into RFEND[0xA0..].
- */
-static void
-rfend_txctune(void)
-{
-    static const uint8_t band_code[3] = { 0xBF, 0xD3, 0xE7 };   /* RE §6.1 */
-    uint8_t co[3];
-    uint8_t ga[3];
-    uint32_t table[WCH_RFEND_VCOTAB_WORDS];
-    int i;
-    int ch;
-
-    for (i = 0; i < 3; i++) {
-        WCH_RFEND_BANDCODE = (WCH_RFEND_BANDCODE & WCH_RFEND_BANDCODE_MASK) |
-                             ((uint32_t)band_code[i] << WCH_RFEND_BANDCODE_SHIFT);
-        WCH_RFEND_TUNE |= WCH_RFEND_TUNE_TRIG;          /* RE §6.1 */
-        (void)poll_reg(&WCH_RFEND_TUNE, WCH_RFEND_TUNE_TRIG, 0,
-                       g_wch_rf_timing.tune_timeout_us);
-        co[i] = (uint8_t)(WCH_RFEND_TUNE_CO & WCH_RFEND_TUNE_CO_MASK);
-        ga[i] = (uint8_t)((WCH_RFEND_TUNE_GA >> WCH_RFEND_TUNE_GA_SHIFT) &
-                          WCH_RFEND_TUNE_GA_MASK);
-    }
-
-    /*
-     * 39-channel interpolation.  RE §6.1 sketches an index-proportional
-     * formula; channels are not evenly spaced in frequency (adv 37/38/39),
-     * so we interpolate on carrier frequency instead - same endpoints,
-     * monotonic in between.  4 bits per channel.
-     */
-    for (ch = 0; ch < 39; ch++) {
-        uint32_t f = freq_for_channel((uint8_t)ch) / 1000UL;    /* MHz */
-        uint32_t vco;
-        uint32_t gain;
-        uint32_t num;
-        uint32_t den;
-
-        if (f <= 2440) {
-            num = f - 2401;
-            den = 39;
-            vco = (uint32_t)co[0] + (((uint32_t)(co[1] - co[0]) * num) + den / 2) / den;
-            gain = (uint32_t)ga[0] + (((uint32_t)(ga[1] - ga[0]) * num) + den / 2) / den;
-        } else {
-            num = f - 2440;
-            den = 40;
-            vco = (uint32_t)co[1] + (((uint32_t)(co[2] - co[1]) * num) + den / 2) / den;
-            gain = (uint32_t)ga[1] + (((uint32_t)(ga[2] - ga[1]) * num) + den / 2) / den;
-        }
-
-        vco &= 0x0FUL;
-        gain &= 0x0FUL;
-        table[ch / 8] |= vco << (4 * (ch % 8));
-
-        /*
-         * The GA table write-back register was not identified during RE
-         * (the lib writes it to "another register group", RE §6.1).  The
-         * interpolated GA values are computed for diagnostics only until a
-         * lib-calibrated RFEND dump locates the real register.
-         */
-        (void)gain;
-    }
-    for (i = 0; i < WCH_RFEND_VCOTAB_WORDS; i++) {
-        WCH_RFEND_VCOTAB(i) = table[i];
-    }
-}
-
-/* RFEND_TXFtune - RE §4.9: RFEND[0x04] |= 0x100 */
-static void
-rfend_txftune(void)
-{
-    WCH_RFEND_TUNE |= WCH_RFEND_TUNE_TXFTUNE;
-}
-
-/* RFEND_RXFilter - RE §6.2 (uses the LLE timer as measurement window) */
-static void
-rfend_rxfilter(void)
-{
-    WCH_RFEND_CFG50 &= ~WCH_RFEND_CFG50_FILT_EN;    /* &= ~0x10000   */
-    WCH_RFEND_FECTRL |= WCH_RFEND_FECTRL_RXFILT;    /* |= 0x200000   */
-    WCH_RFEND_CFG0C ^= WCH_RFEND_CFG0C_FILT_TOGGLE; /* bit4 toggle 1 */
-    WCH_RFEND_CFG0C ^= WCH_RFEND_CFG0C_FILT_TOGGLE; /* bit4 toggle 2 */
-    WCH_LLE_WINDOW = 0x50;                          /* 25 us window  */
-    (void)poll_reg(&WCH_RFEND_FILTMEAS, WCH_RFEND_FILTMEAS_RDY,
-                   WCH_RFEND_FILTMEAS_RDY, g_wch_rf_timing.tune_timeout_us);
-    {
-        uint32_t v = WCH_RFEND_CFG50 & WCH_RFEND_CFG50_FILT_MASK;
-        v |= WCH_RFEND_FILTMEAS & WCH_RFEND_FILTMEAS_MASK;
-        WCH_RFEND_CFG50 = v;
-    }
-    WCH_RFEND_FECTRL &= ~WCH_RFEND_FECTRL_RXFILT;
-    WCH_LLE_WINDOW = 0;
-}
-
-/* RFEND_RXAdc - RE §6.2 */
-static void
-rfend_rxadc(void)
-{
-    WCH_RFEND_CFG58 &= ~WCH_RFEND_CFG58_RXADC;      /* +0x58 bit16 clear */
-    WCH_RFEND_FECTRL |= WCH_RFEND_FECTRL_RXADC;     /* RFEND[8] |= 0x10000 */
-    WCH_RFEND_CFG0C &= ~WCH_RFEND_CFG0C_RXADC;      /* +0x0C bit8 clear  */
-    WCH_RFEND_CFG0C |= WCH_RFEND_CFG0C_RXADC;       /* +0x0C bit8 set    */
-    WCH_RFEND_TUNE &= ~WCH_RFEND_TUNE_RXADC;        /* RFEND[4] bit16 clr */
-    WCH_RFEND_TUNE |= WCH_RFEND_TUNE_RXADC;         /* RFEND[4] bit16 set */
-}
-
-/*
- * RFEND_SetSensitivity - RE §6.2.  The documented portion clears RFEND[0x5C]
- * bits 28/27/19 and sets RFEND[0x50] bits[15:12] = 9; the remaining
- * RFEND[0x48]/[0x4C] "magic combos" are the DevInit baselines applied in
- * rfend_dev_init() below (RE §3.3).
- */
-static void
-rfend_set_sensitivity(void)
-{
-    WCH_RFEND_CFG5C &= ~WCH_RFEND_CFG5C_SENS_CLR;
-    {
-        uint32_t v = WCH_RFEND_CFG50 & WCH_RFEND_CFG50_SENS_MASK;
-        v |= WCH_RFEND_CFG50_SENS_9;
-        WCH_RFEND_CFG50 = v;
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Device init (RE §3)                                                       */
-/* ------------------------------------------------------------------------- */
+/* Analog sequences live separately and use verified byte offsets. */
+extern int wch_rf_analog_init(void);
 
 /* LLE_DevInit - RE §3.2 */
 static void
@@ -523,54 +368,26 @@ lle_dev_init(void)
     WCH_LLE_INIT44 = 0x8C;          /* RE §3.2 */
     WCH_LLE_INIT4C = 0x6C;          /* RE §3.2 */
 
-    /* LLE[0x74] = &(shared RX frame pointer variable) - RE §3.2.  We mirror
-     * the lib layout: the register holds the address of our rxbuf variable. */
-    WCH_LLE_RXBUFPTR_VAR = (uint32_t)&s_rxbuf;
+    /* Vendor stores the RX data base VALUE, never the address of a pointer.
+     * A pointer-to-pointer here makes received RF bytes overwrite globals. */
+    s_rxbuf = s_rx_dma;
+    WCH_LLE_RXBUFPTR = (uint32_t)s_rxbuf;
 
     WCH_LLE_IRQSTAT = 0xFFFF;       /* RE §3.2 */
     WCH_REG32(WCH_LLE_BASE, 0x0C) = 0xF00F;     /* state mask - RE §3.2 */
     s_lle_mask = 0xF00F;
 }
 
-/* RFEND_DevInit - RE §3.3 (RFEND_Reset() not captured by RE; the documented
- * post-reset programming below is applied to POR defaults instead). */
-static void
-rfend_dev_init(void)
-{
-    uint32_t v;
-
-    WCH_RFEND_CFG28 = WCH_RFEND_CFG28_INIT;         /* RFEND[40] = 1152 */
-
-    v = WCH_RFEND_CFG48;                            /* RE §3.3 sequence */
-    v &= 0x8FFFFFFFUL;
-    v |= 0x20000000UL;
-    v &= 0xF8FFFFFFUL;
-    v |= 0x40000000UL;
-    v &= ~0x0000000FUL;
-    v |= 0x00000009UL;
-    v &= 0xFFF8FFFFUL;
-    WCH_RFEND_CFG48 = v;
-
-    v = WCH_RFEND_CFG4C;                            /* RE §3.3 sequence */
-    v |= 0x00000003UL;
-    v &= ~0x00000070UL;
-    v |= 0x00000030UL;
-    v |= 0x00000700UL;
-    v |= 0x01000000UL;
-    v &= ~0x8F000000UL;
-    WCH_RFEND_CFG4C = v;
-}
-
 /* BB_DevInit - RE §3.1 */
 static void
 bb_dev_init(void)
 {
-    uint32_t cfg = 7;       /* sleep-clock accuracy class, low 6 bits (RE §3.1;
-                             * lib takes cfg = ble+0x14; 7 ~ 50 ppm class)     */
+    uint32_t cfg = 9;       /* vendor TX power enum: SetTxPower(0 dBm)=9;
+                             * LL_SetTxPowerLevel writes BB+0x2c bits30:25. */
     uint32_t v;
 
-    WCH_BB_RFCTRL |= 0x80000000UL;                  /* RE §3.1 */
-    WCH_BB_RFCTRL |= 0x00010000UL;                  /* RE §3.1 */
+    WCH_BB_RFCTRL |= 0x00800000UL;                  /* RE §3.1 */
+    WCH_BB_RFCTRL |= 0x10000000UL;                  /* vendor 0x28ac */
     WCH_BB_CFG34 = WCH_BB_CFG34_INIT;               /* 464     */
 
     v = (cfg << WCH_BB_AUTOCFG_CFG_SHIFT) | 0x80010EC8UL;
@@ -601,48 +418,30 @@ wch_rf_init(void)
     OSC->HSE_CAL_CTRL |= 0x03UL << 28;
     OSC->HSE_CAL_CTRL |= 3UL << 24;
 
-    /* RE §3 init order: LLE_DevInit -> RFEND_DevInit -> BB_DevInit */
+    NVIC_DisableIRQ(BB_IRQn);
+    NVIC_DisableIRQ(LLE_IRQn);
     lle_dev_init();
-    rfend_dev_init();
     bb_dev_init();
-    {
-        extern void app_dbg_chk(const char *);
-        app_dbg_chk("rf:dev");
-    }
-
-    /* First-shot analog calibration, same primitive order as the periodic
-     * calibration of RE §6.3. */
-    rfend_txctune();
-    {
-        extern void app_dbg_chk(const char *);
-        app_dbg_chk("rf:txctune");
-    }
-    rfend_txftune();
-    rfend_rxfilter();
-    {
-        extern void app_dbg_chk(const char *);
-        app_dbg_chk("rf:rxfilter");
-    }
-    rfend_rxadc();
-    rfend_set_sensitivity();
-    {
-        extern void app_dbg_chk(const char *);
-        app_dbg_chk("rf:cal-done");
+    int rc = wch_rf_analog_init();
+    if (rc != 0) {
+        return rc;
     }
 
     s_channel = 0xFF;
     s_rx_armed = false;
+    s_rx_progress = false;
     s_auto_arm_rx = false;
-    s_rxbuf = NULL;
+    s_rxbuf = s_rx_dma;
     s_last_anchor = 0;
 
-    /* BB/LLE interrupts stay DISABLED in this port (project decision): the
-     * hand-written ISRs are not validated against the closed-lib handler
-     * semantics (RE §5.2/§5.3), and with the BLE IP clocked they fired
-     * during bring-up and corrupted RAM (manifested as a bogus stack
-     * overflow in the app task).  TX completion is polled anyway
-     * (wch_rf_tx_basic busy-waits on LLE[0x64]); RX event delivery is not
-     * wired up yet. */
+    WCH_BB_IRQSTAT = 0xf0;
+    WCH_LLE_IRQSTAT = 0xffff;
+    NVIC_ClearPendingIRQ(BB_IRQn);
+    NVIC_ClearPendingIRQ(LLE_IRQn);
+    NVIC_SetPriority(LLE_IRQn, 0x20);
+    NVIC_SetPriority(BB_IRQn, 0x40);
+    NVIC_EnableIRQ(BB_IRQn);
+    NVIC_EnableIRQ(LLE_IRQn);
 
     return 0;
 }
@@ -654,34 +453,9 @@ wch_rf_init(void)
 void
 wch_rf_recalibrate(void)
 {
-    if (WCH_LLE_CMD & WCH_LLE_CMD_BUSY_MASK) {
-        return;     /* engine busy: skip this round (RE §6.3 reports via
-                     * rfStatusCB(17,...); we just skip) */
+    if ((WCH_LLE_CMD & WCH_LLE_CMD_BUSY_MASK) == 0) {
+        (void)wch_rf_analog_init();
     }
-
-    wch_rf_guard_enter();
-
-    /* RE §6.3: BB[0] &= ~0x3001 -> |= 0x10000 -> &= ~0x181 -> |= 0x100 */
-    WCH_BB_RFCTRL &= ~0x00003001UL;
-    WCH_BB_RFCTRL |= 0x00010000UL;
-    WCH_BB_RFCTRL &= ~0x00000181UL;
-    WCH_BB_RFCTRL |= 0x00000100UL;
-
-    WCH_RFEND_FECTRL |= WCH_RFEND_FECTRL_RF_ON;     /* RFEND[8] |= 0x330000 */
-    WCH_LLE_MODE = WCH_LLE_TIMEOUT_CAL;             /* LLE[0x50] = 93 (0x5D) */
-
-    rfend_txctune();
-    rfend_txftune();
-    rfend_rxfilter();
-    rfend_rxadc();
-    rfend_set_sensitivity();
-
-    /* RE §6.3: BB[0] = (BB[0] & ~0x181) | 0x80 */
-    WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~0x00000181UL) | 0x00000080UL;
-    WCH_RFEND_FECTRL &= ~0x00320000UL;              /* RFEND[8] &= ~0x320000 */
-    WCH_LLE_MODE = 0;                               /* LLE[0x50] = 0 */
-
-    wch_rf_guard_exit();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -740,7 +514,7 @@ wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us)
                     WCH_BB_RFCTRL_DIR_RX;
 
     WCH_RFEND_FECTRL |= WCH_RFEND_FECTRL_RF_ON;     /* RFEND[0x08] |= 0x330000 */
-    WCH_LLE_TIMEOUT = WCH_LLE_TIMEOUT_TX;           /* LLE[0x14] = 0x5A        */
+    WCH_LLE_MODE = WCH_LLE_TIMEOUT_TX;           /* LLE+0x50, vendor 0x29838 */
 
     WCH_BB_ACCESSADDR = s_aa;                       /* BB[0x08] = accessAddress */
     WCH_BB_CRCINIT = s_crcinit;                     /* BB[0x04] = CRCInit       */
@@ -749,23 +523,28 @@ wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us)
     /* TX buffer: [hdr][len][payload] == lib's [pktTxType][txLen][data] */
     WCH_LLE_FRAMEPTR = (uint32_t)frame;             /* LLE[0x70] - RE §4.6      */
 
-    set_phy_tx_mode(s_phy_tx);                      /* BLE_SetPHYTxMode - §4.4  */
+    set_phy_tx_mode(s_phy_tx, frame[1]);                      /* BLE_SetPHYTxMode - §4.4  */
 
     /* Launch tail - RE §4.6: BB[0x00] |= 0x800000; BB[0x2C] &= ~3; LLE[0]=2 */
     WCH_BB_RFCTRL |= WCH_BB_RFCTRL_TX_TRIG;
     WCH_BB_AUTOCFG &= ~WCH_BB_AUTOCFG_ARM_MASK;
-    WCH_LLE_WINDOW = timeout_half_us;               /* TX window (0.5 us units) */
+    uint32_t hw_window = WCH_LLE_WINDOW;
+    (void)timeout_half_us; /* hardware timing comes from payload length */
+    uint32_t started = os_cputime_get32();
     WCH_LLE_CMD = WCH_LLE_CMD_START_TX;
 
-    /* Block until busy flag clears - RE §4.3 ll_tx_wait_finish. */
-    deadline = os_cputime_get32() + (timeout_half_us / 2U) + 2U;
-    while (WCH_LLE_WINDOW != 0) {
+    /* Countdown expiry alone is not packet success. The basic TX stage
+     * raises bit1, as consumed by rf_tx_basic_txProcess in the vendor lib. */
+    deadline = started + hw_window / 2U + 200U;
+    while ((WCH_LLE_IRQSTAT & WCH_LLE_IRQ_TX_DONE) == 0) {
         if ((int32_t)(os_cputime_get32() - deadline) >= 0) {
             rc = -1;
             break;
         }
     }
 
+    g_wch_rf_tx_elapsed_us[frame[0] & 15U] = os_cputime_get32() - started;
+    g_wch_rf_tx_payload_len[frame[0] & 15U] = frame[1];
     wch_rf_guard_exit();
     return rc;
 }
@@ -777,9 +556,9 @@ wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us)
 int
 wch_rf_rx_basic(uint8_t *rxbuf, uint16_t maxlen, uint32_t window_half_us)
 {
-    (void)maxlen;   /* RxMaxlen limit enforced by the PHY layer buffer size */
 
-    if (rxbuf == NULL) {
+
+    if (rxbuf == NULL || maxlen < WCH_RF_RX_BUFFER_SIZE) {
         return -1;
     }
 
@@ -787,7 +566,7 @@ wch_rf_rx_basic(uint8_t *rxbuf, uint16_t maxlen, uint32_t window_half_us)
 
     if (WCH_LLE_CMD & WCH_LLE_CMD_BUSY_MASK) {
         /* RE §4.7: engine running -> halt first */
-        WCH_LLE_TIMEOUT &= ~WCH_LLE_TIMEOUT_MASK;
+        WCH_LLE_MODE &= ~WCH_LLE_MODE_MASK;
         WCH_LLE_CMD |= WCH_LLE_CMD_FORCE_STOP;
     }
 
@@ -802,14 +581,14 @@ wch_rf_rx_basic(uint8_t *rxbuf, uint16_t maxlen, uint32_t window_half_us)
     WCH_BB_CRCINIT = s_crcinit;                     /* BB[0x04] - RE §4.7 */
     WCH_LLE_CRC_AA_CFG &= ~0x1UL;                   /* LLE[0x04] |= cfg&1 */
 
-    WCH_LLE_FRAMEPTR = (uint32_t)rxbuf;             /* LLE[0x70] = RX buffer */
+    WCH_LLE_RXBUFPTR = (uint32_t)rxbuf; /* independent RX DMA base */
 
     /* BB[0x00] = (BB[0x00] & ~0x180) | 0x100; RFEND[0x08] |= 0x330000 */
     WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_DIR_MASK) |
                     WCH_BB_RFCTRL_DIR_RX;
     WCH_RFEND_FECTRL |= WCH_RFEND_FECTRL_RF_ON;
 
-    WCH_LLE_TIMEOUT = WCH_LLE_TIMEOUT_RX;           /* LLE[0x14] = 0x59, §4.7 */
+    WCH_LLE_MODE = WCH_LLE_TIMEOUT_RX;           /* LLE+0x50, vendor basic RX */
 
     /* RX window width in 0.5 us units (LLE[0x64]) - RE §12.1 step 7.
      * Clock-capture driven window reload (RE §5.2 BB bit6) not replicated:
@@ -818,6 +597,8 @@ wch_rf_rx_basic(uint8_t *rxbuf, uint16_t maxlen, uint32_t window_half_us)
 
     s_rxbuf = rxbuf;
     s_rx_armed = true;
+    s_rx_progress = false;
+    WCH_BB_IRQSTAT = 0xf0;
 
     WCH_LLE_CMD = WCH_LLE_CMD_START_RX;             /* LLE[0x00] = 1 - RE §4.7 */
 
@@ -889,102 +670,39 @@ wch_aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
 /* Interrupt handling (RE §5.2 / §5.3)                                       */
 /* ------------------------------------------------------------------------- */
 
-/*
- * LLE[0x1C] turnaround constant selector - RE §5.3.  Plain 1M/2M keyed on
- * the length byte of the frame just received; encrypted / coded variants.
- */
-static uint32_t
-turnaround_value(void)
+bool
+wch_rf_rx_crc_ok(void)
 {
-    /* Coded PHY unsupported in v1 -> no 108 branch. */
-    if (s_encrypt) {
-        return (s_last_rx_len == 0) ? 93UL : 107UL;
-    }
-    switch (s_last_rx_len) {
-    case 0:  return 93UL;
-    case 1:  return 97UL;
-    case 2:  return 101UL;
-    case 3:  return 105UL;
-    default: return 107UL;
-    }
-}
-
-/*
- * TX->RX T_IFS continuation - RE §4.8 rf_tx_auto_txProcess, relocated from
- * the lib's TMOS task into the TX-done ISR (no TMOS in this port):
- *   1. reprogram synthesizer for the ACK window (RE §4.8)
- *   2. apply the RX demodulator group (BLE_SetPHYRxMode, RE §4.4)
- *   3. load the ACK RX window into LLE[0x64] (0x196 @1M, RE §4.8/§12.1)
- *   4. point LLE[0x70] at the RX buffer
- *   5. set BB[0x2C] RX-arm (RE §5.3 TX-done handling)
- */
-static void
-arm_ack_rx(void)
-{
-    dev_set_channel(s_channel, lo_inject_for_phy(s_phy_rx));
-    set_phy_rx_mode(s_phy_rx);
-    WCH_LLE_WINDOW = (s_phy_rx == 2) ? g_wch_rf_timing.ack_window_half_us_2m
-                                     : g_wch_rf_timing.ack_window_half_us_1m;
-    WCH_LLE_FRAMEPTR = (uint32_t)s_rxbuf;
-    WCH_BB_AUTOCFG = (WCH_BB_AUTOCFG & ~WCH_BB_AUTOCFG_ARM_MASK) |
-                     WCH_BB_AUTOCFG_ARM_RX;
-    s_rx_armed = true;
+    return s_rx_crc_ok;
 }
 
 void
 wch_rf_lle_isr(void)
 {
-    uint32_t st = WCH_LLE_IRQSTAT;                  /* RE §5.3: status source */
-
-    /* bit2 = TX done (RE §5.3): turnaround constant FIRST, then optional
-     * auto RX-arm, then write 4 to clear. */
-    if (st & WCH_LLE_IRQ_TX_DONE) {
-        WCH_LLE_TURNAROUND = turnaround_value();
-        if (s_auto_arm_rx) {
-            arm_ack_rx();
+    uint32_t st = WCH_LLE_IRQSTAT;
+    bool was_rx = s_rx_armed;
+    /* Basic mode only. Auto sequencer uses different stage/event meanings. */
+    if (st & WCH_LLE_IRQ_RX_DONE) {
+        s_rx_crc_ok = (WCH_BB_IRQSTAT & 0x20UL) == 0;
+        WCH_LLE_IRQSTAT = WCH_LLE_IRQ_RX_DONE;
+        if (was_rx && s_rxbuf != NULL) {
+            s_last_rx_len = s_rxbuf[1];
+            s_rx_armed = false;
+            notify(WCH_RF_EVT_RX_DONE, os_cputime_get32());
         }
-        WCH_LLE_IRQSTAT = WCH_LLE_IRQ_TX_DONE;      /* write 4 to clear */
+    }
+    if (st & WCH_LLE_IRQ_TX_DONE) {
+        WCH_LLE_IRQSTAT = WCH_LLE_IRQ_TX_DONE;
         notify(WCH_RF_EVT_TX_DONE, os_cputime_get32());
     }
-
-    /* bit1 = RX done (RE §5.3): write 2 to clear. */
-    if (st & WCH_LLE_IRQ_RX_DONE) {
-        if (s_rxbuf != NULL) {
-            s_last_rx_len = s_rxbuf[1];             /* len byte, RE §5.3 */
-        }
-        s_rx_armed = false;
-        s_auto_arm_rx = false;
-        WCH_LLE_IRQSTAT = WCH_LLE_IRQ_RX_DONE;      /* write 2 to clear */
-        notify(WCH_RF_EVT_RX_DONE, os_cputime_get32());
-    }
-
-    /* bit0 / bit3 = aux state events (RE §5.3). Clear; counted via callback
-     * payload only if a consumer cares. */
-    if (st & 0x1UL) {
-        WCH_LLE_IRQSTAT = 0x1UL;
-    }
-    if (st & 0x8UL) {
-        WCH_LLE_IRQSTAT = 0x8UL;
-    }
-
-    /* bit14 = LLE tick (RE §5.3): reload tick, write 0x40000 to clear.
-     * Only when the LLE[0x0C] mask has bit14 enabled. */
-    if ((st & 0x4000UL) && (s_lle_mask & 0x4000UL)) {
-        WCH_LLE_TICK = 0xFFFFFFFFUL;
-        WCH_LLE_IRQSTAT = WCH_LLE_IRQ_TICK_CLR;
-    }
-
-    /* bit12 / bit13 / bit15: extended-advertising aux state bits (RE §5.3).
-     * v1 NimBLE glue does not use ext-adv aux state machines; clear only. */
-    if (st & 0x1000UL) {
-        WCH_LLE_IRQSTAT = 0x1000UL;
-    }
     if (st & 0x2000UL) {
-        WCH_LLE_IRQSTAT = 0x2000UL;
+        WCH_LLE_IRQSTAT = 0x2000;
+        if (was_rx && !(st & WCH_LLE_IRQ_RX_DONE)) {
+            s_rx_armed = false;
+            notify(WCH_RF_EVT_RX_TIMEOUT, 0);
+        }
     }
-    if (st & 0x8000UL) {
-        WCH_LLE_IRQSTAT = 0x8000UL;
-    }
+    WCH_LLE_IRQSTAT = st & (0xffffUL & ~0x2003UL);
 }
 
 void
@@ -998,29 +716,16 @@ wch_rf_bb_isr(void)
     if (st & WCH_BB_IRQSTAT_CLKCAP) {
         s_last_anchor = os_cputime_get32();
         WCH_BB_IRQSTAT = WCH_BB_IRQSTAT_CLKCAP_CLR;
+        if (s_rx_armed && !s_rx_progress) {
+            s_rx_progress = true;
+            /* Address match closes WFR, then allow the entire PDU. */
+            WCH_LLE_WINDOW = 16U * (255U + 10U) + 100U;
+            notify(WCH_RF_EVT_RX_START, s_last_anchor);
+        }
     }
 
-    /* bit4 / bit7 = error / timeout (RE §5.2): write 0x10 / 0x80 to clear.
-     * While an RX was armed with no frame received this is the RX window
-     * timeout (wfr). */
-    if (st & WCH_BB_IRQSTAT_ERR) {
-        WCH_BB_IRQSTAT = WCH_BB_IRQSTAT_ERR_CLR;
-        if (s_rx_armed) {
-            s_rx_armed = false;
-            notify(WCH_RF_EVT_RX_TIMEOUT, 0);
-        } else {
-            notify(WCH_RF_EVT_HW_ERR, st);
-        }
-    }
-    if (st & WCH_BB_IRQSTAT_ERR2) {
-        WCH_BB_IRQSTAT = WCH_BB_IRQSTAT_ERR2_CLR;
-        if (s_rx_armed) {
-            s_rx_armed = false;
-            notify(WCH_RF_EVT_RX_TIMEOUT, 0);
-        } else {
-            notify(WCH_RF_EVT_HW_ERR, st);
-        }
-    }
+    /* Vendor 0x3191a..0x31946 only acknowledges these timer flags. */
+    WCH_BB_IRQSTAT = st & 0x90UL;
 
     /* AES completion is delivered through the BB vector - RE §5.2:
      * AES[0x04] bit1 set -> clear with ~3. */

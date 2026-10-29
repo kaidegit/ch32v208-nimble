@@ -21,6 +21,7 @@
 #include "syscfg/syscfg.h"
 #include "os/os.h"
 #include "os/os_cputime.h"
+#include "hal/hal_timer.h"
 #include "nimble/ble.h"
 #include "nimble/nimble_opt.h"
 #include "controller/ble_phy.h"
@@ -61,6 +62,7 @@ struct ble_phy_stats
 {
     uint32_t phy_isrs;
     uint32_t tx_good;
+    uint32_t tx_started;
     uint32_t tx_fail;
     uint32_t tx_late;
     uint32_t tx_bytes;
@@ -78,8 +80,16 @@ struct ble_phy_stats
 static struct ble_phy_stats g_ble_phy_stats;
 
 /* TX frame: [hdr][len][payload]; RX buffer keeps a small guard tail */
-static uint8_t g_ble_phy_tx_buf[BLE_PHY_MAX_PDU_LEN];
-static uint8_t g_ble_phy_rx_buf[BLE_PHY_MAX_PDU_LEN + 4];
+static uint8_t g_ble_phy_tx_buf[BLE_PHY_MAX_PDU_LEN] __attribute__((aligned(4)));
+#define g_ble_phy_rx_buf (wch_rf_rx_frame())
+static struct hal_timer s_phy_wfr_timer;
+static void phy_rx_timeout_isr(void);
+
+static void phy_wfr_expired(void *arg)
+{
+    (void)arg;
+    phy_rx_timeout_isr();
+}
 
 /* Software scheduling (v1 timing model) */
 static uint8_t s_tx_sched_valid;
@@ -96,18 +106,6 @@ static uint64_t s_enc_counter;
 static uint8_t s_enc_dir_bit;
 static uint8_t s_enc_hdr_mask;
 
-/*
- * CRC verdict policy (reviewer integration note):
- * The RE findings locate no hardware CRC status bit, and the lib re-verifies
- * in software against a SEPARATE CRC storage (DAT_20000334, RE §12.0) whose
- * location this port does not know.  crc24_compute() assumes the LLE appends
- * the 3 CRC bytes after the payload - unverified on silicon.  Default is to
- * TRUST the hardware verdict (every frame CRC-OK); flip to 1 on the board to
- * A/B the assumption (every frame failing => CRC bytes are NOT in the buffer
- * => find the real status bit before trusting either way).
- */
-static uint8_t s_crc_sw_verify;
-
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------- */
@@ -117,36 +115,6 @@ load32_le(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-/*
- * Software CRC-24 of a BLE PDU (BLE_PHY_MAX_PDU_LEN bytes worst case).
- * Poly x^24+x^10+x^9+x^6+x^4+x^3+x+1, reflected constant 0xDA6000, init =
- * CRCInit.
- *
- * RE note: the LLE checks CRC in hardware but RE §4.8 shows the lib still
- * re-verifies in software (ble_ll_chkcrc) because no CRC-status register was
- * identified (RE §5.3 status bits carry no CRC flag).  TODO(board): locate
- * the hardware CRC status bit and drop this software pass.
- */
-static uint32_t
-crc24_compute(const uint8_t *d, uint16_t len, uint32_t crcinit)
-{
-    uint32_t crc = crcinit & 0xFFFFFFUL;
-    uint16_t i;
-    int b;
-
-    for (i = 0; i < len; i++) {
-        crc ^= d[i];
-        for (b = 0; b < 8; b++) {
-            if (crc & 1UL) {
-                crc = (crc >> 1) ^ 0xDA6000UL;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    return crc & 0xFFFFFFUL;
 }
 
 /* Generous hardware TX busy-window: preamble+AA+CRC ~ 80 us + 8 us/byte. */
@@ -248,16 +216,20 @@ phy_tx_done_isr(uint32_t ts)
         return;
     }
 
+    ++g_ble_phy_stats.tx_good;
     if (transition == BLE_PHY_TRANSITION_TX_RX) {
-        /*
-         * wch_rf already armed the T_IFS RX (RE §4.8 rf_tx_auto_txProcess
-         * relocated into the TX-done ISR): synth retuned, RX demod group
-         * applied, ACK window in LLE[0x64], BB[0x2C] RX-arm set.
-         * TODO(board): confirm the BB[0x2C]-only (lib-faithful) arm path
-         * starts the RX window; fallback is an explicit LLE[0x00]=1 here.
-         */
+        /* Basic sequencer stages have unambiguous completion flags.
+         * Listen after TX while the controller waits for a scan/connect
+         * request; the bounded WFR callback also closes an empty window. */
         g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
         g_ble_phy_data.phy_rx_started = 0;
+        uint32_t window_us = BLE_LL_IFS + g_wch_rf_timing.ack_window_half_us_1m / 2U;
+        if (wch_rf_rx_basic(g_ble_phy_rx_buf, WCH_RF_RX_BUFFER_SIZE,
+                            window_us * 2U) != 0) {
+            phy_rx_timeout_isr();
+        } else {
+            (void)hal_timer_start(&s_phy_wfr_timer, window_us + 100U);
+        }
     } else {
         g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
     }
@@ -279,6 +251,7 @@ phy_rx_done_isr(uint32_t ts)
         return;
     }
 
+    (void)hal_timer_stop(&s_phy_wfr_timer);
     g_ble_phy_data.phy_rx_started = 1;
     ++g_ble_phy_stats.rx_starts;
 
@@ -287,10 +260,10 @@ phy_rx_done_isr(uint32_t ts)
         len = BLE_PHY_MAX_PDU_LEN - BLE_LL_PDU_HDR_LEN;
     }
 
-    /* Provisional header (CRC verdict added below).  RE §4.9 RSSI = BB[0xC0]
+    /* Provisional header (CRC verdict added below). RSSI comes from BB+0x30
      * bits[22:15]; anchor timestamp = BB clock-capture (RE §5.2) taken at
      * access-address match, falling back to the completion timestamp. */
-    ble_hdr->rxinfo.flags = 0;
+    ble_hdr->rxinfo.flags = ble_ll_state_get();
     ble_hdr->rxinfo.channel = g_ble_phy_data.phy_chan;
     ble_hdr->rxinfo.handle = 0;
     ble_hdr->rxinfo.rssi = wch_rf_rssi();
@@ -314,10 +287,8 @@ phy_rx_done_isr(uint32_t ts)
         return;
     }
 
-    /* CRC verdict - see s_crc_sw_verify note above. */
-    if (!s_crc_sw_verify ||
-        (crc24_compute(rxbuf, (uint16_t)(len + BLE_LL_PDU_HDR_LEN),
-                       g_ble_phy_data.phy_crcinit) == 0)) {
+    /* Vendor ble_ll_chkcrc reads BB+0x38 bit5 after actual RX completion. */
+    if (wch_rf_rx_crc_ok()) {
         ble_hdr->rxinfo.flags |= BLE_MBUF_HDR_F_CRC_OK;
         ++g_ble_phy_stats.rx_valid;
     } else {
@@ -360,6 +331,12 @@ wch_phy_rf_event(enum wch_rf_event evt, uint32_t payload)
     case WCH_RF_EVT_TX_DONE:
         phy_tx_done_isr(payload);
         break;
+    case WCH_RF_EVT_RX_START:
+        if (g_ble_phy_data.phy_state == BLE_PHY_STATE_RX) {
+            g_ble_phy_data.phy_rx_started = 1;
+            (void)hal_timer_stop(&s_phy_wfr_timer);
+        }
+        break;
     case WCH_RF_EVT_RX_DONE:
         phy_rx_done_isr(payload);
         break;
@@ -389,6 +366,9 @@ ble_phy_init(void)
 
     s_tx_sched_valid = 0;
     s_rx_sched_valid = 0;
+
+    (void)hal_timer_set_cb(MYNEWT_VAL(OS_CPUTIME_TIMER_NUM), &s_phy_wfr_timer,
+                           phy_wfr_expired, NULL);
 
     /* Driver events arrive through the wch_rf ISR callback. */
     wch_rf_set_callback(wch_phy_rf_event);
@@ -479,7 +459,11 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
     uint8_t pyld_len;
     int rc;
 
-    if (ble_phy_state_get() != BLE_PHY_STATE_IDLE) {
+    /* In basic mode rx_started is set only at RX completion. The LL can
+     * request a scan/data response from ble_ll_rx_end while state is RX. */
+    if (ble_phy_state_get() != BLE_PHY_STATE_IDLE &&
+        !(ble_phy_state_get() == BLE_PHY_STATE_RX &&
+          g_ble_phy_data.phy_rx_started)) {
         ble_phy_disable();
         ++g_ble_phy_stats.radio_state_errs;
         return BLE_PHY_ERR_RADIO_STATE;
@@ -526,7 +510,7 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
         return BLE_PHY_ERR_RADIO_STATE;
     }
 
-    ++g_ble_phy_stats.tx_good;
+    ++g_ble_phy_stats.tx_started;
     g_ble_phy_stats.tx_bytes += (uint32_t)pyld_len + BLE_LL_PDU_HDR_LEN;
     return BLE_ERR_SUCCESS;
 }
@@ -601,6 +585,7 @@ ble_phy_tx_power_get(void)
 void
 ble_phy_disable(void)
 {
+    (void)hal_timer_stop(&s_phy_wfr_timer);
     wch_rf_shut();
     wch_rf_auto_arm_rx(false);
     wch_rf_encrypt_set(false);
@@ -638,7 +623,7 @@ ble_phy_rx(void)
     /* Arm the engine with the default window; ble_phy_wfr_enable() refines
      * the window (LLE[0x64] is a live schedule value, RE §12.2).  Arming
      * here also covers scan flows that never call wfr_enable. */
-    rc = wch_rf_rx_basic(g_ble_phy_rx_buf, sizeof(g_ble_phy_rx_buf),
+    rc = wch_rf_rx_basic(g_ble_phy_rx_buf, WCH_RF_RX_BUFFER_SIZE,
                          rx_window_default_half_us());
     if (rc != 0) {
         g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
@@ -655,7 +640,7 @@ ble_phy_restart_rx(void)
     if (g_ble_phy_data.phy_state == BLE_PHY_STATE_RX) {
         return;
     }
-    wch_rf_rx_basic(g_ble_phy_rx_buf, sizeof(g_ble_phy_rx_buf),
+    wch_rf_rx_basic(g_ble_phy_rx_buf, WCH_RF_RX_BUFFER_SIZE,
                     rx_window_default_half_us());
     g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
     g_ble_phy_data.phy_rx_started = 0;
@@ -682,7 +667,7 @@ ble_phy_wfr_enable(int txrx, uint8_t tx_phy_mode, uint32_t wfr_usecs)
     if (g_ble_phy_data.phy_state != BLE_PHY_STATE_RX) {
         g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
         g_ble_phy_data.phy_rx_started = 0;
-        (void)wch_rf_rx_basic(g_ble_phy_rx_buf, sizeof(g_ble_phy_rx_buf),
+        (void)wch_rf_rx_basic(g_ble_phy_rx_buf, WCH_RF_RX_BUFFER_SIZE,
                               rx_window_default_half_us());
     }
 

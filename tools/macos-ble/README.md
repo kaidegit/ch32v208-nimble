@@ -40,7 +40,14 @@ requests repeated advertisement callbacks; macOS may still coalesce reports.
 Output is JSONL, with UTC timestamps and a final `summary` event. Advertisement
 events include the CoreBluetooth UUID, local/cached names, RSSI, match status,
 and all advertisement fields exposed by CoreBluetooth. Binary fields are encoded
-as hex. macOS does not expose BLE MAC addresses, raw radio packets, advertising
+as hex. When reflashing the same public MAC, macOS can retain the previous firmware's
+name, including `kCBAdvDataLocalName`. During this investigation the NimBLE
+manufacturer bytes `5743` appeared under the previous `Simple Peripheral` name.
+Compare the stable CoreBluetooth identifier as well as the name; use `--id` for
+a known board when diagnosing name caching. An empty name match count alone
+does not prove that the board was absent from an unfiltered scan.
+
+macOS does not expose BLE MAC addresses, raw radio packets, advertising
 channel, or CRC validity through CoreBluetooth. A scan receiving other devices
 but no target shows that the Mac's scan path works; it does not by itself identify
 why the board's advertisements are absent. Stored logs may contain nearby device
