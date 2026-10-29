@@ -58,7 +58,10 @@ The probe expects service `7a02480e-6d4d-4e8e-b7a2-d1c4a2f13e01`, uptime
 UUIDs match `app/app_ble.c`. Reads and optional writes are serialized. A probe
 failure, missing test characteristic, malformed uptime, or echo mismatch returns
 a nonzero exit code. The global timeout includes Bluetooth startup, scanning,
-connection, discovery, and GATT operations.
+connection, discovery, and GATT operations. On completion the client keeps its
+run loop alive for the asynchronous disconnect, with an additional two-second
+cleanup bound, before exiting. This makes repeated probe runs wait for the
+previous connection to close.
 
 On the first run, macOS may request Bluetooth permission for the binary or its
 launching app. Grant access in the system prompt. If denied, enable the relevant

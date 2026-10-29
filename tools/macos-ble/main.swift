@@ -126,6 +126,7 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     var advertisements = 0
     var target: CBPeripheral?
     var finished = false
+    var pendingExit: (Int32, String)?
     var connected = false
     var startedScan = false
     var pendingServices = 0
@@ -168,7 +169,25 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         finished = true
         timer?.invalidate()
         manager?.stopScan()
-        if let target = target, target.state != .disconnected { manager?.cancelPeripheralConnection(target) }
+        if let target = target, target.state == .connected {
+            pendingExit = (code, reason)
+            manager?.cancelPeripheralConnection(target)
+            // Keep the run loop alive for the asynchronous disconnect.
+            timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in
+                emit("disconnect_cleanup_timeout")
+                self?.exitNow(code: code, reason: reason)
+            }
+            return
+        }
+        if let target = target, target.state != .disconnected {
+            manager?.cancelPeripheralConnection(target)
+        }
+        exitNow(code: code, reason: reason)
+    }
+
+    func exitNow(code: Int32, reason: String) {
+        timer?.invalidate()
+        pendingExit = nil
         emit("summary", ["reason": reason, "exit_code": code,
                          "elapsed_seconds": Date().timeIntervalSince(started),
                          "advertisements": advertisements, "unique_devices": seen.count,
@@ -233,6 +252,12 @@ final class BLESession: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        if let (code, reason) = pendingExit {
+            emit("disconnected", ["expected": true,
+                                  "error": error?.localizedDescription as Any? ?? NSNull()])
+            exitNow(code: code, reason: reason)
+            return
+        }
         guard !finished else { return }
         emit("disconnected", ["error": error?.localizedDescription as Any? ?? NSNull()])
         finish(code: 5, reason: "unexpected_disconnect")
