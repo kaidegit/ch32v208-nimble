@@ -293,7 +293,9 @@ static void panic_enter( void )
     {
         uint32_t spin = PANIC_SPIN_MAX;
 
-        while( ( ( DMA1->INTFR & DMA_GIF4 ) == 0 ) && --spin )
+        /* GIF also includes the half-transfer flag, even with HTIE off.
+         * Only completion or transfer error permits taking the channel. */
+        while( ( ( DMA1->INTFR & ( DMA_TCIF4 | DMA_TEIF4 ) ) == 0 ) && --spin )
         {
         }
         /* Whether or not it completed, the segment is abandoned; skip it

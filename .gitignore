@@ -9,3 +9,4 @@ build*/
 *.hex
 *.bin
 *.map
+__pycache__/

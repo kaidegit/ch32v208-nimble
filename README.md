@@ -18,6 +18,8 @@ Android 手机互通排查及 RX→TX 软件等待调整见
 [手机互通记录](docs/android-interop-2026-10-30.md)；
 [ADB 手机工具](tools/android-ble/README.md)直接操作现有 nRF Connect，保留用户过滤器。
 旧逆向笔记和下方历史表包含已推翻的寄存器解释，新增驱动修改必须核对原厂指令。
+最新日志适配与手机短测见[UART DMA复核记录](docs/uart-review-2026-10-30.md)。
+上面的84分钟结果属于旧108us镜像；当前仍保留独立运行队列故障的取证点，尚未重新完成长测。
 
 **项目定位**：用 Apache NimBLE（controller + host 全开源）直接驱动 CH32V208 的蓝牙硬件，验证/测试该芯片的 BLE 功能。RF/BB/LLE 寄存器级驱动逆向自 WCH 闭源库 `libwchble.a`（见 [WCH_BLE_LIB_RE_FINDINGS.md](../../WCH_BLE_LIB_RE_FINDINGS.md)），**不用 WCH 闭源协议栈、不用 TMOS**。CMake 构建，FreeRTOS + NimBLE NPL(freertos)，probe-rs + WCH-LinkE 烧录/停机取证，EasyLogger + USART1 DMA 日志。
 
