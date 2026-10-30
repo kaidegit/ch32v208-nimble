@@ -2,8 +2,9 @@
  * wch_rf.h - WCH CH32V208 BLE baseband / link-layer-engine / RF-AFE register
  *            level driver (reverse-engineered from libwchble.a / wchble_rom).
  *
- * Single source of truth for every magic number in this file:
- *   WCH_BLE_LIB_RE_FINDINGS.md (workspace root), referenced as "RE §x.y".
+ * Vendor instructions and measured behavior take precedence over comments.
+ * Historical notes in WCH_BLE_LIB_RE_FINDINGS.md (workspace root, "RE §x.y")
+ * include unverified assumptions; they are investigation pointers.
  *
  * This driver implements the raw RF primitives ONLY. The Apache NimBLE glue
  * lives in ble_phy_wch.c / ble_hw_wch.c next to this file.

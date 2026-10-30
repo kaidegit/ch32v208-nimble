@@ -10,8 +10,8 @@
  * Every log call site compiles to
  *     BLE_HS_LOG(INFO, "fmt\n", ...)   ==   BLE_HS_LOG_INFO("fmt\n", ...)
  * which becomes a static inline calling ble_npl_log_rtt_put('I', fmt, ap).
- * Output line format: "[I] <message>\n" (the newline is appended here; stack
- * log messages do not end with one).
+ * Output line format: "[I] <message>\n". The caller supplies newlines; a
+ * logical line may consist of multiple calls (notably ACL hex dumps).
  */
 #ifndef _NIMBLE_NPL_OS_LOG_WCH_H_
 #define _NIMBLE_NPL_OS_LOG_WCH_H_

@@ -5,11 +5,13 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,10 +26,13 @@ def emit(event, **fields):
     print(json.dumps(dict(event=event, time=utc(), **fields)), flush=True)
 
 
-def capture(out, chip, gdb):
+def capture(out, chip, gdb, elf=None):
     """Called only after a failed test; halts the board and leaves RAM intact."""
     server_log = out / 'probe-gdb.log'
     snapshot = out / 'failure.gdb.txt'
+    fd, ram_name = tempfile.mkstemp(prefix='wch-ram-', suffix='.bin', dir='/tmp')
+    os.close(fd)
+    ram_path = Path(ram_name)
     with server_log.open('w') as sf:
         server = subprocess.Popen(['probe-rs', 'gdb', '--chip', chip,
                                    '--gdb-connection-string', 'localhost:3333'],
@@ -37,26 +42,34 @@ def capture(out, chip, gdb):
             if server.poll() is not None:
                 raise RuntimeError('probe-rs GDB server exited; see probe-gdb.log')
             commands = ['target remote localhost:3333',
-                        'set mem inaccessible-by-default off', 'p xTickCount',
+                        'set mem inaccessible-by-default off', 'info registers', 'bt 12',
+                        'printf "CAPTURE_PC=0x%x\\n", $pc', 'p xTickCount',
                         'p g_config_assert_line', 'p/x g_exc_trap_words',
-                        'p g_ble_phy_stats', 'p g_wch_rf_analog_stage',
+                        'p uxCriticalNesting', 'p s_critical_nesting',
+                        'p/x pxCurrentTCB', 'p g_port_switch_bad_critical',
+                        'p g_ble_phy_stats', 'p/x g_wch_phy_tx_fail_snapshot',
+                        'p g_wch_rf_analog_stage',
                         'p/x g_wch_rf_analog_status', 'p g_wch_rf_tune_ready_mask',
                         'p g_wch_rf_tune_expired_mask', 'p g_wch_rf_tune_started',
                         'p g_wch_rf_tune_finished', 'p g_wch_rf_tune_window',
                         'p g_wch_rf_tune_iterations', 'p g_wch_timer',
                         'p g_ble_phy_data', 'p/x g_wch_phy_control_trace',
                         'x/32wx 0x40024200',
-                        f'dump binary memory {json.dumps(str(out / "failure.ram.bin"), ensure_ascii=False)} 0x20000000 0x20010000',
+                        f'dump binary memory {ram_path} 0x20000000 0x20010000',
                         'detach']
-            cmd = [gdb, '-q', '-batch', str(ROOT / 'build/ch32v208_nimble.elf')]
+            cmd = [gdb, '-q', '-batch', str(elf or ROOT / 'build/ch32v208_nimble.elf')]
             for command in commands:
                 cmd += ['-ex', command]
             with snapshot.open('w') as f:
                 result = subprocess.run(cmd, cwd=ROOT, stdout=f,
                                         stderr=subprocess.STDOUT, timeout=40)
+            if ram_path.stat().st_size != 65536 or not re.search(r'CAPTURE_PC=0x[0-9a-fA-F]+', snapshot.read_text()):
+                raise RuntimeError('GDB did not capture live registers and 64KB RAM; see failure.gdb.txt')
+            shutil.copy2(ram_path, out / 'failure.ram.bin')
             return dict(log=str(snapshot), exit_code=result.returncode,
-                        core_left_halted=True)
+                        core_left_halted=True, ram_bytes=65536)
         finally:
+            ram_path.unlink(missing_ok=True)
             server.terminate()
             try:
                 server.wait(5)
@@ -98,6 +111,9 @@ def main():
     report['client_source_sha256'] = hashlib.sha256((ROOT / 'tools/macos-ble/main.swift').read_bytes()).hexdigest()
     report['firmware_test_identity'] = next((line for line in (ROOT / 'build/CMakeCache.txt').read_text().splitlines()
                                              if line.startswith('CH32_BLE_TEST_IDENTITY:')), None)
+    # Keep the tested symbols even if a later build replaces build/*.elf.
+    saved_elf = out / 'firmware.elf'
+    shutil.copy2(elf, saved_elf)
     def save():
         temp = out / 'report.tmp'
         temp.write_text(json.dumps(report, indent=2, default=str) + '\n')
@@ -191,7 +207,7 @@ def main():
                 break
         if failed and shutil.which('probe-rs') and Path(args.gdb).exists():
             try:
-                report['failure_capture'] = capture(out, args.chip, args.gdb)
+                report['failure_capture'] = capture(out, args.chip, args.gdb, saved_elf)
                 emit('failure_captured', **report['failure_capture'])
             except Exception as exc:
                 report['capture_error'] = str(exc)

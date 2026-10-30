@@ -24,12 +24,11 @@ Purpose : User configuration file for RTT, tailored for the
 */
 
 //
-// Up buffer: host reads our logs (4 KB so banner + bursts survive
-// between RTT viewer polls in NO_BLOCK_SKIP mode).
-// Down buffer: host -> target input, kept small.
+// Actual RTT option names (SEGGER_RTT_BUFFER_SIZE_* were ignored). Keep
+// the existing 1 KB / 16 B allocation within this board's 64 KB RAM.
 //
-#define SEGGER_RTT_BUFFER_SIZE_UP     (4096)    // Bytes
-#define SEGGER_RTT_BUFFER_SIZE_DOWN   (64)      // Bytes
+#define BUFFER_SIZE_UP               (1024)
+#define BUFFER_SIZE_DOWN             (16)
 
 //
 // Default operating mode: drop newest bytes when the up buffer is full
@@ -48,16 +47,12 @@ Purpose : User configuration file for RTT, tailored for the
 #if defined(__GNUC__) && (defined(__riscv) || defined(__riscv_xlen))
   #define SEGGER_RTT_LOCK()  {                                            \
       unsigned int _SEGGER_RTT__LockState;                                \
-      __asm volatile ( "csrr  %0, mstatus  \n\t"                          \
-                       "csrci mstatus, 8    \n\t"                         \
-                       "andi  %0, %0, 8     \n\t"                         \
-                       : "=r" ( _SEGGER_RTT__LockState ) : : );           \
+      __asm volatile ( "csrrci %0, mstatus, 8; fence.i"                    \
+                       : "=r" ( _SEGGER_RTT__LockState ) : : "memory" );  \
 
   #define SEGGER_RTT_UNLOCK()                                             \
-      __asm volatile ( "csrr  a1, mstatus  \n\t"                          \
-                       "or    %0, %0, a1    \n\t"                         \
-                       "csrs  mstatus, %0   \n\t"                         \
-                       : : "r" ( _SEGGER_RTT__LockState ) : "a1" );       \
+      __asm volatile ( "csrw mstatus, %0"                                \
+                       : : "r" ( _SEGGER_RTT__LockState ) : "memory" );  \
   }
 #endif
 

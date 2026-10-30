@@ -110,6 +110,8 @@ add_library(nimble_core STATIC
     ${NIMBLE_TRANSPORT_SRC}
     ${NIMBLE_PORT_SRC}
     ${NIMBLE_NPL_FREERTOS_SRC}
+    ${NIMBLE_DIR}/nimble/host/services/gap/src/ble_svc_gap.c
+    ${NIMBLE_DIR}/nimble/host/services/gatt/src/ble_svc_gatt.c
 )
 target_include_directories(nimble_core PUBLIC
     # config/ first: provides vendored syscfg/syscfg.h (+ overrides)
@@ -118,6 +120,8 @@ target_include_directories(nimble_core PUBLIC
     ${NIMBLE_DIR}/porting/npl/freertos/include
     ${NIMBLE_DIR}/nimble/include
     ${NIMBLE_DIR}/nimble/host/include
+    ${NIMBLE_DIR}/nimble/host/services/gap/include
+    ${NIMBLE_DIR}/nimble/host/services/gatt/include
     ${NIMBLE_DIR}/nimble/controller/include
     ${NIMBLE_DIR}/nimble/transport/include
 )

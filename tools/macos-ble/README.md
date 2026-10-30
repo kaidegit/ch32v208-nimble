@@ -144,13 +144,16 @@ python3 tools/macos-ble/reliability.py --phase soak --phys 2m --duration 1200
 
 Results are saved under `.build/reliability-<UTC timestamp>/`: `report.json`
 records each case, firmware ELF hash, revision, working changes and client source
-hash (and the runner source hash in current versions); raw JSONL logs preserve every callback. Each reset/reconnect case writes
+hash (and the runner source hash in current versions); `firmware.elf` preserves
+the matching symbols even if another build replaces the build output. Raw JSONL logs preserve every callback. Each reset/reconnect case writes
 and verifies one payload (lengths 0,1,3,20,63,64). This tests software reset through
 probe-rs, not a physical power cycle. The wrapper stops on the first failure;
 there is no automatic retry that can turn a failed case into a pass.
 
 After a failure it uses probe-rs GDB plus `/tmp/gdb-wch-fixed` (override with
-`--gdb`) to save registers/diagnostics and 64KB RAM. The core stays halted to
+`--gdb`) to save registers/diagnostics and 64KB RAM. Capture success requires
+live PC output and a complete 65536-byte RAM file, not only GDB's exit code.
+The core stays halted to
 preserve evidence; finish diagnosis and reset before the next run. GDB is never
 attached while a successful continuous-link test is running. Use `--id` to select
 the exact board if multiple devices use the same name. The wrapper uses `caffeinate` while it runs to prevent idle sleep, without changing

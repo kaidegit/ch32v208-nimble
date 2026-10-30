@@ -234,6 +234,18 @@ void vPortEndScheduler( void )
 	for( ;; );
 }
 /*-----------------------------------------------------------*/
+/* A context switch must never preempt a task critical section. Preserve
+ * the first violation before it can corrupt a task's queue wait lists. */
+volatile UBaseType_t g_port_switch_bad_critical;
+void vPortSwitchContext(void)
+{
+    if (uxCriticalNesting != 0) {
+        g_port_switch_bad_critical = uxCriticalNesting;
+        configASSERT(uxCriticalNesting == 0);
+    }
+    vTaskSwitchContext();
+}
+
 void SysTick_Handler(void) __attribute__((interrupt()));
 void SysTick_Handler( void )
 {
@@ -278,14 +290,14 @@ void vPortExitCritical( void )
 portUBASE_TYPE xPortSetInterruptMask(void)
 {
     portUBASE_TYPE uvalue=0;
-    __asm volatile("csrrw %0, mstatus, %1":"=r"(uvalue):"r"(0x1800));
+    __asm volatile("csrrw %0, mstatus, %1; fence.i":"=r"(uvalue):"r"(0x1800):"memory");
     return uvalue;
 }
 
 /*-----------------------------------------------------------*/
 void vPortClearInterruptMask(portUBASE_TYPE uvalue)
 {
-    __asm volatile("csrw  mstatus, %0"::"r"(uvalue));
+    __asm volatile("csrw  mstatus, %0"::"r"(uvalue):"memory");
 }
 
 

@@ -75,7 +75,7 @@
 #define MYNEWT_VAL_BLE_LL_CFG_FEAT_LE_CODED_PHY (0)    /* controller/syscfg.yml:302 = BLE_PHY_CODED = 0 */
 #define MYNEWT_VAL_BLE_LL_DTM (1)                      /* controller/syscfg.yml:408 default 0 -> overridden on (RF bring-up) */
 #define MYNEWT_VAL_BLE_LL_WHITELIST_SIZE (8)           /* controller/syscfg.yml:102 default '8'; explicit */
-#define MYNEWT_VAL_BLE_LL_SCA (20)                     /* controller/syscfg.yml:61 default 60 -> 20 ppm: our cputime is HSE(32MHz)-derived, crystal class */
+#define MYNEWT_VAL_BLE_LL_SCA (50)                     /* HSE-derived cputime; match EVT's external-crystal 50 ppm budget, not a measured 20 ppm claim. */
 
 /* Flow control / monitor / HCI logging: 沿用默认并显式化 (syscfg.h:1091). */
 #define MYNEWT_VAL_BLE_HS_FLOW_CTRL (0)

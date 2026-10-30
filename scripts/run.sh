@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run.sh - flash + run the firmware under probe-rs and stream RTT logs.
+# run.sh - flash and reset; leave the BLE target running independently.
 #
 # probe-rs auto-discovers the WCH-LinkE probe and the RTT control block in
 # the ELF. Extra args are forwarded to probe-rs download.
@@ -30,11 +30,7 @@ echo
 echo "[run] flashing ${ELF}"
 probe-rs download --chip "${CHIP}" "$@" "${ELF}"
 
-# Use the canonical Flash entry explicitly for reproducible debug starts.
-# Startup also handles reset through alias0 with an absolute trampoline.
-echo "[run] starting through 0x08000000; Ctrl-C detaches"
-exec probe-rs debug --chip "${CHIP}" "${ELF}" \
-    -c break \
-    -c "wreg sp 0x20010000" \
-    -c "wreg pc 0x08000000" \
-    -c c
+# Startup's absolute trampoline handles the reset alias. Starting normally
+# also avoids leaving an interactive debugger in control of the BLE clock.
+probe-rs reset --chip "${CHIP}"
+echo "[run] target running; live RTT is intrusive on this CH32/probe-rs path"

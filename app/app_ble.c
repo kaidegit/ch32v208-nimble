@@ -52,6 +52,8 @@
 #include "host/ble_gatt.h"
 #include "host/ble_store.h"
 #include "host/ble_uuid.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 #include "app_ble.h"
 
@@ -501,7 +503,14 @@ app_ble_start(void)
      * / bonding anyway). */
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
-    /* 3. GATT service registration: safe here - ble_gatts_add_svcs() only
+    /* 3. Standard services are not installed by ble_hs_init(). Register
+     * them explicitly, as the upstream bleprph application does. */
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    rc = ble_svc_gap_device_name_set(APP_BLE_DEV_NAME);
+    configASSERT(rc == 0);
+
+    /* GATT service registration: safe here - ble_gatts_add_svcs() only
      *    queues the definition; the ATT database is built in
      *    ble_gatts_start() once the host task services the start event. */
     rc = ble_gatts_count_cfg(app_gatt_svcs);

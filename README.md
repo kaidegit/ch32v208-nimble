@@ -14,6 +14,9 @@
 累计10291轮回读校验，覆盖约71.6分钟的cputime回卷。复位VCO超时误报已修复。
 详见[可靠性测试记录](docs/reliability-2026-10-30.md)。coded PHY和仪器级时序仍未验证。
 macOS 测试客户端见 [tools/macos-ble](tools/macos-ble/README.md)。
+Android 手机互通排查及 RX→TX 软件等待调整见
+[手机互通记录](docs/android-interop-2026-10-30.md)；
+[ADB 手机工具](tools/android-ble/README.md)直接操作现有 nRF Connect，保留用户过滤器。
 旧逆向笔记和下方历史表包含已推翻的寄存器解释，新增驱动修改必须核对原厂指令。
 
 **项目定位**：用 Apache NimBLE（controller + host 全开源）直接驱动 CH32V208 的蓝牙硬件，验证/测试该芯片的 BLE 功能。RF/BB/LLE 寄存器级驱动逆向自 WCH 闭源库 `libwchble.a`（见 [WCH_BLE_LIB_RE_FINDINGS.md](../../WCH_BLE_LIB_RE_FINDINGS.md)），**不用 WCH 闭源协议栈、不用 TMOS**。CMake 构建，FreeRTOS + NimBLE NPL(freertos)，probe-rs + WCH-LinkE + SEGGER RTT 日志。
@@ -65,7 +68,7 @@ macOS 测试客户端见 [tools/macos-ble](tools/macos-ble/README.md)。
 |---|---|
 | WCH GCC | `riscv32-wch-elf-gcc` 15（MounRiver 发行版），默认路径 `~/DevTools/riscv32-wch-elf-gcc-15`，可用 `WCH_TOOLCHAIN_DIR` 环境变量覆盖 |
 | CMake | ≥ 3.20 |
-| probe-rs | ≥ 0.32（`run.sh` 使用其 debug 终端处理 WCH 启动地址） |
+| probe-rs | ≥ 0.32（下载、复位和非阻塞 RTT） |
 | 调试器 | WCH-LinkE |
 | 目标芯片 | CH32V208WBU6（默认）/ CBU6 / RBT6，芯片名可换 |
 
@@ -74,8 +77,8 @@ macOS 测试客户端见 [tools/macos-ble](tools/macos-ble/README.md)。
 ```bash
 scripts/build.sh                 # Release 构建 → build/ch32v208_nimble.{elf,hex,bin}
 scripts/build.sh --clean         # 清理后重建
-scripts/run.sh                   # 烧录 + 设置调试入口 + RTT 日志（Ctrl-C 退出）
-scripts/attach.sh                # 只附加运行中的目标，看 RTT 不烧录
+scripts/run.sh                   # 烧录 + 正常复位，目标独立运行
+scripts/attach.sh                # RTT 诊断，不烧录；当前路径会暂停CPU，不能用于BLE时序验证
 scripts/gdb.sh                   # 起 GDB server :3333，另开终端连 riscv32-wch-elf-gdb
 ```
 
@@ -86,11 +89,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE=cmake/riscv32-wch.toolchain.cmake
 cmake --build build -j$(sysctl -n hw.ncpu)
 probe-rs download --chip CH32V208WBU6 build/ch32v208_nimble.elf
-probe-rs debug --chip CH32V208WBU6 build/ch32v208_nimble.elf \
-    -c break -c 'wreg sp 0x20010000' -c 'wreg pc 0x08000000' -c c
+probe-rs reset --chip CH32V208WBU6
 ```
 
-**probe-rs 芯片名**：与 WCH-LinkE 目标封装对应——`CH32V208WBU6`（QFN48）、`CH32V208CBU6`（QFN32）、`CH32V208RBT6`（LQFP64）。任一脚本均可用 `CHIP=xxx scripts/xxx.sh` 覆盖，无需改代码。原入口在`0x0`别名下会算错CRT地址，现已增加绝对跳转；`run.sh`仍保留上述显式入口启动链路，便于重复调试。
+**probe-rs 芯片名**：与 WCH-LinkE 目标封装对应——`CH32V208WBU6`（QFN48）、`CH32V208CBU6`（QFN32）、`CH32V208RBT6`（LQFP64）。任一脚本均可用 `CHIP=xxx scripts/xxx.sh` 覆盖，无需改代码。启动代码已通过绝对跳转处理`0x0`复位别名，`run.sh`使用正常复位，不自动附加RTT。本板probe-rs RTT使用ProgramBuffer暂停CPU读RAM，会干扰BLE；`attach.sh`指定`no-block-skip`只能避免缓冲区阻塞，不能消除暂停。串口日志迁移任务见[交接prompt](docs/uart-easylogger-handoff.md)。
 
 ## 上板验证计划（S0–S5）
 

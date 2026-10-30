@@ -109,7 +109,7 @@ at the top of this file. */
 .global pxPortInitialiseStack
 
 .extern pxCurrentTCB
-.extern vTaskSwitchContext
+.extern vPortSwitchContext
 .extern xISRStackTop
 /*-----------------------------------------------------------*/
 .align 8
@@ -160,7 +160,7 @@ SW_Handler:
 //	csrs 0x804, a1
 
 	load_x sp, xISRStackTop				/* Switch to ISR stack before function call. */
-	jal vTaskSwitchContext
+	jal vPortSwitchContext
 
 processed_source:
 	load_x  t1, pxCurrentTCB			/* Load pxCurrentTCB. */

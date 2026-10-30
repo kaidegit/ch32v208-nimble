@@ -106,8 +106,8 @@ extern void vPortClearInterruptMask(portUBASE_TYPE uvalue);
 
 #define portSET_INTERRUPT_MASK_FROM_ISR()  xPortSetInterruptMask()
 #define portCLEAR_INTERRUPT_MASK_FROM_ISR( uxSavedStatusValue )  vPortClearInterruptMask(uxSavedStatusValue)
-#define portDISABLE_INTERRUPTS()	__asm volatile( "csrw mstatus,%0" ::"r"(0x1800) )
-#define portENABLE_INTERRUPTS()		__asm volatile( "csrw mstatus,%0" ::"r"(0x1888) )
+#define portDISABLE_INTERRUPTS()	__asm volatile( "csrw mstatus,%0; fence.i" ::"r"(0x1800) : "memory" )
+#define portENABLE_INTERRUPTS()		__asm volatile( "csrw mstatus,%0" ::"r"(0x1888) : "memory" )
 #define portENTER_CRITICAL()	vPortEnterCritical()
 #define portEXIT_CRITICAL()		vPortExitCritical()
 /*-----------------------------------------------------------*/

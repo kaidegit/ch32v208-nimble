@@ -255,6 +255,9 @@ int main( void )
     /* SystemInit() already ran from the reset handler; refresh the
      * variable from the programmed PLL (96 MHz, 32 MHz HSE x3). */
     SystemCoreClockUpdate();
+    /* All active BLE timing comes from HSE/PLL -> TIM3 and SysTick.
+     * Do not inherit an enabled LSI from a previous firmware. */
+    RCC->RSTSCKR &= ~RCC_LSION;
 
     SEGGER_RTT_Init();
 
@@ -262,6 +265,10 @@ int main( void )
     SEGGER_RTT_printf( 0, "CH32V208 NimBLE bring-up\r\n" );
     SEGGER_RTT_printf( 0, "build   : %s %s\r\n", __DATE__, __TIME__ );
     SEGGER_RTT_printf( 0, "sysclk  : %u Hz\r\n", ( unsigned ) SystemCoreClock );
+    SEGGER_RTT_printf( 0, "osc     : HSE(on/ready)=%u/%u LSE=%u/%u LSI=%u/%u\r\n",
+                       !!( RCC->CTLR & RCC_HSEON ), !!( RCC->CTLR & RCC_HSERDY ),
+                       !!( RCC->BDCTLR & RCC_LSEON ), !!( RCC->BDCTLR & RCC_LSERDY ),
+                       !!( RCC->RSTSCKR & RCC_LSION ), !!( RCC->RSTSCKR & RCC_LSIRDY ) );
     SEGGER_RTT_printf( 0, "kernel  : FreeRTOS %s, tick %d Hz\r\n",
                        tskKERNEL_VERSION_NUMBER, ( int ) configTICK_RATE_HZ );
     SEGGER_RTT_printf( 0, "heap    : FreeRTOS %u B + newlib [%p..%p] (%u B)\r\n",
@@ -271,7 +278,7 @@ int main( void )
     SEGGER_RTT_printf( 0, "stack   : %p..%p\r\n",
                        ( void * ) _susrstack, ( void * ) _eusrstack );
     /* Memory split actually loaded by the chip (RM ch.32): FLASH_OBR[9:7]
-     * RAM_CODE_MOD - 000=CODE-128K+RAM-64K, 01x=144K+48K, 1xx=160K+32K;
+     * RAM_CODE_MOD - 00x=CODE-128K+RAM-64K, 01x=144K+48K, 1xx=160K+32K;
      * ESIG F_SIZE @0x1FFFF7E0 = usable code flash in KB.  The ld assumes
      * 128K zero-wait code window + 64K SRAM - verify, don't trust. */
     SEGGER_RTT_printf( 0, "memcfg  : OBR=%08x ram_code_mod=%u fsize=%uK\r\n",

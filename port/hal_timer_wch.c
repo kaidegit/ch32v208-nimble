@@ -65,7 +65,7 @@ wch_irq_lock(void)
 {
     uint32_t mstatus;
 
-    __asm__ volatile ("csrrc %0, mstatus, %1"
+    __asm__ volatile ("csrrc %0, mstatus, %1; fence.i"
                       : "=r" (mstatus) : "r" (0x8) : "memory");
     return mstatus;
 }

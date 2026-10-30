@@ -3104,6 +3104,9 @@ void vTaskPlaceOnEventList( List_t * const pxEventList,
                             const TickType_t xTicksToWait )
 {
     configASSERT( pxEventList );
+    /* Catch the first double enqueue before it creates a self-linked list
+     * and leaves vListInsert spinning with interrupts disabled. */
+    configASSERT( listLIST_ITEM_CONTAINER( &( pxCurrentTCB->xEventListItem ) ) == NULL );
 
     /* THIS FUNCTION MUST BE CALLED WITH EITHER INTERRUPTS DISABLED OR THE
      * SCHEDULER SUSPENDED AND THE QUEUE BEING ACCESSED LOCKED. */

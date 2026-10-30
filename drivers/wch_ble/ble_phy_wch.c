@@ -126,10 +126,16 @@ static void phy_wfr_expired(void *arg)
 /* Software scheduling (v1 timing model) */
 static uint32_t s_rx_end_cputime;
 static uint8_t s_rx_end_payload_len;
-/* Board-calibrated at 96 MHz: wait from RX done before RF preparation.
- * The remaining RF path plus ~34 us hardware start delay completes T_IFS.
- * Scope-level timing/conformance and other clock rates remain unvalidated. */
-volatile uint32_t g_wch_phy_response_delay_us = 108;
+/* Software wait from RX done before RF preparation on the 96 MHz board.
+ * The RF path also includes ~34 us hardware start latency. Scope-level
+ * timing/conformance and other clock rates remain unvalidated. */
+/* OPPO/Qualcomm active scanning rejects the earlier 108us SCAN_RSP path.
+ * A tagged 70..132us sweep produced valid Android HCI responses at110..132;
+ * use120us inside that observed window for the shared RX->TX path.
+ * This is a measured interoperability setting, not an air-level IFS proof. */
+volatile uint32_t g_wch_phy_response_delay_us = 120;
+/* First TX failure, before recovery: command, IRQ status, window, BB control. */
+volatile uint32_t g_wch_phy_tx_fail_snapshot[4];
 static uint8_t s_tx_sched_valid;
 static uint32_t s_tx_sched_cputime;
 static uint8_t s_tx_sched_rem_us;
@@ -572,9 +578,17 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
                          (uint16_t)(pyld_len + BLE_LL_PDU_HDR_LEN),
                          tx_window_half_us(pyld_len));
     if (rc != 0) {
+        if (g_ble_phy_stats.tx_fail == 0) {
+            g_wch_phy_tx_fail_snapshot[0] = WCH_LLE_CMD;
+            g_wch_phy_tx_fail_snapshot[1] = WCH_LLE_IRQSTAT;
+            g_wch_phy_tx_fail_snapshot[2] = WCH_LLE_WINDOW;
+            g_wch_phy_tx_fail_snapshot[3] = WCH_BB_RFCTRL;
+        }
         ++g_ble_phy_stats.tx_fail;
-        g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
-        wch_rf_auto_arm_rx(false);
+        /* A failed wait can leave the engine busy. Reset both hardware and
+         * software state so later connection/advertising events can run.
+         * The failed packet still propagates to the LL; do not retry it. */
+        ble_phy_disable();
         return BLE_PHY_ERR_RADIO_STATE;
     }
 
