@@ -33,4 +33,4 @@ probe-rs download --chip "${CHIP}" "$@" "${ELF}"
 # Startup's absolute trampoline handles the reset alias. Starting normally
 # also avoids leaving an interactive debugger in control of the BLE clock.
 probe-rs reset --chip "${CHIP}"
-echo "[run] target running; live RTT is intrusive on this CH32/probe-rs path"
+echo "[run] target running; UART logs: scripts/log.sh (921600 8N1)"

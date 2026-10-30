@@ -104,11 +104,11 @@ extern uint32_t SystemCoreClock;
  * provided by app/main.c (hooks enabled above; no prototypes here since
  * this header is included before the FreeRTOS types exist). */
 
-/* Assert: freeze with interrupts masked and report over RTT
- * (SEGGER_RTT_printf, integer-only).  The line number is also stashed
- * into fixed RAM before printing: bring-up saw the RTT print lost when
- * the assert fired with a broken stack (app/ch32v20x_it.c reads these
- * back via gdb). */
+/* Assert: freeze with interrupts masked and report over the UART
+ * (wch_log_panic - integer-only formatting, polled output that is safe
+ * with interrupts disabled).  The line number is also stashed into fixed
+ * RAM before printing: bring-up saw the print lost when the assert fired
+ * with a broken stack (app/ch32v20x_it.c reads these back via gdb). */
 extern volatile uint32_t g_config_assert_line;
 
 #define configASSERT( x ) \
@@ -117,11 +117,11 @@ extern volatile uint32_t g_config_assert_line;
         { \
             taskDISABLE_INTERRUPTS(); \
             g_config_assert_line = __LINE__; \
-            SEGGER_RTT_printf( 0, "configASSERT failed: %s:%d\r\n", __FILE__, __LINE__ ); \
+            wch_log_panic( "configASSERT failed: %s:%d\r\n", __FILE__, __LINE__ ); \
             for( ;; ) { } \
         } \
     } while( 0 )
 
-#include "../third_party/segger_rtt/SEGGER_RTT.h"
+#include "../port/wch_log.h"
 
 #endif /* FREERTOS_CONFIG_H */

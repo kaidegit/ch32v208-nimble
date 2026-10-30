@@ -1,8 +1,9 @@
 /*
  * port/syscalls.c - newlib-nano syscall stubs for the CH32V208 bring-up.
  *
- *  - console I/O goes through SEGGER RTT channel 0
- *    (_write -> RTT up buffer, _read -> RTT down buffer)
+ *  - console I/O goes through the project log backend (USART1 DMA ring,
+ *    port/console_uart.c): _write -> log ring, _read -> EOF (PA10 is wired
+ *    as USART1 RX but nothing consumes it - no shell by design)
  *  - _sbrk grows the newlib heap between the ld/Link.ld symbols
  *    _heap_start / _heap_end (located above .bss, below the 2 KB
  *    reset stack)
@@ -21,7 +22,7 @@
 
 #include "FreeRTOS.h"
 #include "task.h"
-#include "SEGGER_RTT.h"
+#include "wch_log.h"
 
 #undef errno
 extern int errno;
@@ -76,7 +77,7 @@ void __malloc_unlock( struct _reent * r )
 }
 
 /*--------------------------------------------------------------------*/
-/* Console: RTT channel 0                                             */
+/* Console: USART1 DMA log ring                                       */
 /*--------------------------------------------------------------------*/
 
 ssize_t _write( int fd, const void * buf, size_t len )
@@ -86,22 +87,21 @@ ssize_t _write( int fd, const void * buf, size_t len )
         errno = EBADF;
         return -1;
     }
-    /* Everything (stdout and stderr) is funnelled into RTT ch 0. */
-    return ( ssize_t ) SEGGER_RTT_Write( 0, buf, len );
+    /* Everything (stdout and stderr) is funnelled into the log ring.  The
+     * ring may drop under burst (counted in wch_log stats); report the
+     * requested length so newlib never retries in a loop. */
+    wch_log_write( buf, len );
+    return ( ssize_t ) len;
 }
 
 ssize_t _read( int fd, void * buf, size_t len )
 {
-    if( ( buf == NULL ) || ( fd < 0 ) )
-    {
-        errno = EBADF;
-        return -1;
-    }
-    if( len == 0 )
-    {
-        return 0;
-    }
-    return ( ssize_t ) SEGGER_RTT_Read( 0, buf, len );
+    ( void ) fd;
+    ( void ) buf;
+    ( void ) len;
+    /* PA10 is configured as USART1 RX, but no receive consumer exists
+     * (no shell by design): reads see EOF. */
+    return 0;
 }
 
 /*--------------------------------------------------------------------*/
@@ -228,7 +228,7 @@ void _exit( int status )
 {
     ( void ) status;
     taskDISABLE_INTERRUPTS();
-    SEGGER_RTT_printf( 0, "\r\n[_exit] status=%d - halting\r\n", status );
+    wch_log_panic( "\r\n[_exit] status=%d - halting\r\n", status );
     for( ;; )
     {
     }

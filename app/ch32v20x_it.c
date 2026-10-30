@@ -31,7 +31,7 @@
 
 #include <stdint.h>
 #include "ch32v20x.h"
-#include "SEGGER_RTT.h"
+#include "wch_log.h"
 
 /* Plain interrupt() attribute: the compiler emits a full software
  * prologue/epilogue.  The "WCH-Interrupt-fast" variant must only be used
@@ -48,6 +48,7 @@ void HardFault_Handler( void ) __attribute__( ( interrupt ) );
 void TIM3_IRQHandler( void ) __attribute__( ( interrupt ) );
 void BB_IRQHandler( void ) __attribute__( ( interrupt ) );
 void LLE_IRQHandler( void ) __attribute__( ( interrupt ) );
+void DMA1_Channel4_IRQHandler( void ) __attribute__( ( interrupt ) );
 
 /* Bring-up forensics: nothing in this project enables the WWDG, yet the
  * core was found parked in its weak spin stub.  A strong handler turns
@@ -60,6 +61,10 @@ void WWDG_IRQHandler( void ) __attribute__( ( interrupt ) );
 extern void hal_timer_wch_irq( void ) __attribute__( ( weak ) );
 extern void wch_rf_bb_isr( void ) __attribute__( ( weak ) );
 extern void wch_rf_lle_isr( void ) __attribute__( ( weak ) );
+
+/* Log ring DMA completion (port/console_uart.c; logger lib is linked into
+ * both images, so a direct strong reference is fine). */
+extern void wch_log_dma_irq( void );
 
 /*********************************************************************
  * Shared reporter for the startup's unused-vector stubs.  The .S shim
@@ -81,10 +86,10 @@ void wch_stub_trap_report( uint32_t mcause, uint32_t mepc, uint32_t mtval )
     g_stub_trap_words[ 6 ] = PFIC->IACTR[ 0 ];
     g_stub_trap_words[ 7 ] = PFIC->GISR;
 
-    SEGGER_RTT_printf( 0, "\r\n[STUB-TRAP] mcause=%08x mepc=%08x mtval=%08x\r\n",
-                       mcause, mepc, mtval );
-    SEGGER_RTT_printf( 0, "[STUB-TRAP] iactr0=%08x gisr=%08x\r\n",
-                       g_stub_trap_words[ 6 ], g_stub_trap_words[ 7 ] );
+    wch_log_panic( "\r\n[STUB-TRAP] mcause=%08x mepc=%08x mtval=%08x\r\n",
+                   ( unsigned ) mcause, ( unsigned ) mepc, ( unsigned ) mtval );
+    wch_log_panic( "[STUB-TRAP] iactr0=%08x gisr=%08x\r\n",
+                   ( unsigned ) g_stub_trap_words[ 6 ], ( unsigned ) g_stub_trap_words[ 7 ] );
     for( ;; )
     {
     }
@@ -95,7 +100,7 @@ void wch_stub_trap_report( uint32_t mcause, uint32_t mepc, uint32_t mtval )
  *********************************************************************/
 void NMI_Handler( void )
 {
-    SEGGER_RTT_WriteString( 0, "\r\n[NMI] NMI taken, halting.\r\n" );
+    wch_log_panic( "\r\n[NMI] NMI taken, halting.\r\n" );
     for( ;; )
     {
     }
@@ -118,17 +123,17 @@ void HardFault_Handler( void )
     __asm volatile( "csrr %0, mepc"   : "=r"( mepc ) );
     __asm volatile( "csrr %0, mtval"  : "=r"( mtval ) );
 
-    SEGGER_RTT_printf( 0, "\r\n[HardFault] mcause=0x%08X mepc=0x%08X mtval=0x%08X\r\n",
-                       mcause, mepc, mtval );
-    SEGGER_RTT_printf( 0, "[HardFault] tcb@%08x=%08x\r\n",
-                       ( unsigned ) ( uintptr_t ) &pxCurrentTCB,
-                       ( unsigned ) ( uintptr_t ) pxCurrentTCB );
+    wch_log_panic( "\r\n[HardFault] mcause=0x%08x mepc=0x%08x mtval=0x%08x\r\n",
+                   ( unsigned ) mcause, ( unsigned ) mepc, ( unsigned ) mtval );
+    wch_log_panic( "[HardFault] tcb@%08x=%08x\r\n",
+                   ( unsigned ) ( uintptr_t ) &pxCurrentTCB,
+                   ( unsigned ) ( uintptr_t ) pxCurrentTCB );
     for( i = 0; i < 7; i++, p += 4 )
     {
-        SEGGER_RTT_printf( 0, "  %08x: %08x %08x %08x %08x\r\n",
-                           ( unsigned ) ( uintptr_t ) p,
-                           ( unsigned ) p[ 0 ], ( unsigned ) p[ 1 ],
-                           ( unsigned ) p[ 2 ], ( unsigned ) p[ 3 ] );
+        wch_log_panic( "  %08x: %08x %08x %08x %08x\r\n",
+                       ( unsigned ) ( uintptr_t ) p,
+                       ( unsigned ) p[ 0 ], ( unsigned ) p[ 1 ],
+                       ( unsigned ) p[ 2 ], ( unsigned ) p[ 3 ] );
     }
     for( ;; )
     {
@@ -157,13 +162,13 @@ void WWDG_IRQHandler( void )
     __asm volatile( "csrr %0, mepc"   : "=r"( mepc ) );
     __asm volatile( "csrr %0, mtval"  : "=r"( mtval ) );
 
-    SEGGER_RTT_printf( 0, "\r\n[WWDG] mcause=%08x mepc=%08x mtval=%08x\r\n",
-                       mcause, mepc, mtval );
-    SEGGER_RTT_printf( 0, "[WWDG] isr=%08x %08x %08x\r\n",
-                       PFIC->ISR[ 0 ], PFIC->ISR[ 1 ], PFIC->ISR[ 2 ] );
-    SEGGER_RTT_printf( 0, "[WWDG] iactr=%08x %08x %08x gisr=%08x cfgr=%08x\r\n",
-                       PFIC->IACTR[ 0 ], PFIC->IACTR[ 1 ], PFIC->IACTR[ 2 ],
-                       PFIC->GISR, PFIC->CFGR );
+    wch_log_panic( "\r\n[WWDG] mcause=%08x mepc=%08x mtval=%08x\r\n",
+                   ( unsigned ) mcause, ( unsigned ) mepc, ( unsigned ) mtval );
+    wch_log_panic( "[WWDG] isr=%08x %08x %08x\r\n",
+                   ( unsigned ) PFIC->ISR[ 0 ], ( unsigned ) PFIC->ISR[ 1 ], ( unsigned ) PFIC->ISR[ 2 ] );
+    wch_log_panic( "[WWDG] iactr=%08x %08x %08x gisr=%08x cfgr=%08x\r\n",
+                   ( unsigned ) PFIC->IACTR[ 0 ], ( unsigned ) PFIC->IACTR[ 1 ], ( unsigned ) PFIC->IACTR[ 2 ],
+                   ( unsigned ) PFIC->GISR, ( unsigned ) PFIC->CFGR );
     for( ;; )
     {
     }
@@ -186,4 +191,14 @@ void LLE_IRQHandler( void )
     {
         wch_rf_lle_isr();
     }
+}
+
+/*********************************************************************
+ * DMA1 channel 4: log-ring drain (USART1_TX).  Body in
+ * port/console_uart.c; the ISR only advances ring indices and chains
+ * the next contiguous segment - it never logs or blocks.
+ *********************************************************************/
+void DMA1_Channel4_IRQHandler( void )
+{
+    wch_log_dma_irq();
 }

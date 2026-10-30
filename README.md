@@ -19,7 +19,7 @@ Android 手机互通排查及 RX→TX 软件等待调整见
 [ADB 手机工具](tools/android-ble/README.md)直接操作现有 nRF Connect，保留用户过滤器。
 旧逆向笔记和下方历史表包含已推翻的寄存器解释，新增驱动修改必须核对原厂指令。
 
-**项目定位**：用 Apache NimBLE（controller + host 全开源）直接驱动 CH32V208 的蓝牙硬件，验证/测试该芯片的 BLE 功能。RF/BB/LLE 寄存器级驱动逆向自 WCH 闭源库 `libwchble.a`（见 [WCH_BLE_LIB_RE_FINDINGS.md](../../WCH_BLE_LIB_RE_FINDINGS.md)），**不用 WCH 闭源协议栈、不用 TMOS**。CMake 构建，FreeRTOS + NimBLE NPL(freertos)，probe-rs + WCH-LinkE + SEGGER RTT 日志。
+**项目定位**：用 Apache NimBLE（controller + host 全开源）直接驱动 CH32V208 的蓝牙硬件，验证/测试该芯片的 BLE 功能。RF/BB/LLE 寄存器级驱动逆向自 WCH 闭源库 `libwchble.a`（见 [WCH_BLE_LIB_RE_FINDINGS.md](../../WCH_BLE_LIB_RE_FINDINGS.md)），**不用 WCH 闭源协议栈、不用 TMOS**。CMake 构建，FreeRTOS + NimBLE NPL(freertos)，probe-rs + WCH-LinkE 烧录/停机取证，EasyLogger + USART1 DMA 日志。
 
 ## 架构
 
@@ -44,7 +44,7 @@ Android 手机互通排查及 RX→TX 软件等待调整见
    │ RFEND 0x40025000  射频模拟前端  │
    │ AES  0x40024300   硬件 AES-128 │
    └────────────────────────────────┘
-   旁路: FreeRTOS + NPL(freertos)｜SEGGER RTT 日志｜TIM3 → os_cputime(1 MHz)
+   旁路: FreeRTOS + NPL(freertos)｜USART1 DMA 日志｜TIM3 → os_cputime(1 MHz)
 ```
 
 ## 目录结构
@@ -53,12 +53,12 @@ Android 手机互通排查及 RX→TX 软件等待调整见
 |---|---|
 | `app/` | 应用层：`main.c`（启动+FreeRTOS+weak `app_ble_start`）、`app_ble.c/h`（NimBLE 外设应用）、`system_ch32v20x.c`（时钟）、`ch32v20x_it.c`（中断向量） |
 | `drivers/wch_ble/` | `wch_rf.c`（BB/LLE/RFEND/AES 寄存器驱动）、`ble_phy_wch.c`（NimBLE PHY 适配）、`ble_hw_wch.c`（NimBLE HW 适配+私有地址） |
-| `port/` | 平台移植：`nimble_port_wch.c`（`nimble_port_init` 替代实现）、`hal_timer_wch.c`（TIM3→os_cputime 1 MHz）、`console_rtt.c`（console→RTT）、`syscalls.c`（newlib 存根）、`console/`、`segger_rtt/` |
+| `port/` | 平台移植：`nimble_port_wch.c`（`nimble_port_init` 替代实现）、`hal_timer_wch.c`（TIM3→os_cputime 1 MHz）、`console_uart.c`（console/NPL/EasyLogger→USART1 DMA）、`wch_log.h`、`syscalls.c`（newlib 存根） |
 | `config/` | 顶层配置：NimBLE `syscfg.h` 裁剪（优先于栈内默认值） |
 | `third_party/` | vendored 依赖（见下方"第三方组件与许可"） |
 | `cmake/` | `riscv32-wch.toolchain.cmake`（WCH GCC 工具链） |
 | `ld/Link.ld` | 链接脚本（FLASH 0x08000000 / RAM，ISR 敏感代码段 `.highcode`） |
-| `scripts/` | `build.sh` / `run.sh` / `attach.sh` / `gdb.sh` |
+| `scripts/` | `build.sh` / `run.sh` / `log.sh` / `serial_log.py` / `gdb.sh` |
 
 ## 构建与调试
 
@@ -68,7 +68,7 @@ Android 手机互通排查及 RX→TX 软件等待调整见
 |---|---|
 | WCH GCC | `riscv32-wch-elf-gcc` 15（MounRiver 发行版），默认路径 `~/DevTools/riscv32-wch-elf-gcc-15`，可用 `WCH_TOOLCHAIN_DIR` 环境变量覆盖 |
 | CMake | ≥ 3.20 |
-| probe-rs | ≥ 0.32（下载、复位和非阻塞 RTT） |
+| probe-rs | ≥ 0.32（下载、复位和停机取证） |
 | 调试器 | WCH-LinkE |
 | 目标芯片 | CH32V208WBU6（默认）/ CBU6 / RBT6，芯片名可换 |
 
@@ -78,7 +78,9 @@ Android 手机互通排查及 RX→TX 软件等待调整见
 scripts/build.sh                 # Release 构建 → build/ch32v208_nimble.{elf,hex,bin}
 scripts/build.sh --clean         # 清理后重建
 scripts/run.sh                   # 烧录 + 正常复位，目标独立运行
-scripts/attach.sh                # RTT 诊断，不烧录；当前路径会暂停CPU，不能用于BLE时序验证
+scripts/log.sh --list             # 列出USB串口（依赖pyserial）
+scripts/log.sh -p /dev/cu.usbmodemXXX  # PA9 TX / PA10 RX，921600 8N1，无流控
+scripts/attach.sh                # log.sh兼容入口，不再打开探针或RTT
 scripts/gdb.sh                   # 起 GDB server :3333，另开终端连 riscv32-wch-elf-gdb
 ```
 
@@ -92,7 +94,7 @@ probe-rs download --chip CH32V208WBU6 build/ch32v208_nimble.elf
 probe-rs reset --chip CH32V208WBU6
 ```
 
-**probe-rs 芯片名**：与 WCH-LinkE 目标封装对应——`CH32V208WBU6`（QFN48）、`CH32V208CBU6`（QFN32）、`CH32V208RBT6`（LQFP64）。任一脚本均可用 `CHIP=xxx scripts/xxx.sh` 覆盖，无需改代码。启动代码已通过绝对跳转处理`0x0`复位别名，`run.sh`使用正常复位，不自动附加RTT。本板probe-rs RTT使用ProgramBuffer暂停CPU读RAM，会干扰BLE；`attach.sh`指定`no-block-skip`只能避免缓冲区阻塞，不能消除暂停。串口日志迁移任务见[交接prompt](docs/uart-easylogger-handoff.md)。
+**probe-rs 芯片名**：与 WCH-LinkE 目标封装对应——`CH32V208WBU6`（QFN48）、`CH32V208CBU6`（QFN32）、`CH32V208RBT6`（LQFP64）。任一脚本均可用 `CHIP=xxx scripts/xxx.sh` 覆盖，无需改代码。启动代码已通过绝对跳转处理`0x0`复位别名，`run.sh`使用正常复位，不自动附加RTT。日志已迁移为USART1（PA9 TX、PA10 RX）、921600、8N1、无流控，由DMA1通道4发送；`log.sh`只读串口。普通日志有界入队，满时计数丢弃；异常采用有界轮询输出。本板probe-rs RTT使用ProgramBuffer暂停CPU读RAM，会干扰BLE，因此当前固件不链接RTT。`gdb.sh`也会暂停CPU，仅用于取证。HSE保留，LSI显式关闭。
 
 ## 上板验证计划（S0–S5）
 
@@ -176,7 +178,8 @@ probe-rs reset --chip CH32V208WBU6
 |---|---|---|---|
 | WCH CH32V20x SDK（HAL/startup） | `third_party/sdk` | WCH EVT（MounRiver 发行包） | WCH 随包许可，原样使用 |
 | FreeRTOS 内核 | `third_party/freertos` | upstream FreeRTOS-Kernel | MIT |
-| SEGGER RTT | `third_party/segger_rtt` | SEGGER RTT 发行包 | SEGGER RTT 按其自带许可条款使用（permissive source-available） |
+| EasyLogger | `third_party/easylogger` | armink/EasyLogger `806328e131836662fa83dd43364a53f699fd76ac` | MIT，见随附LICENSE和VENDORED.md |
+| SEGGER RTT（历史源码，当前不编译） | `third_party/segger_rtt` | SEGGER RTT 发行包 | 依其自带许可 |
 | Apache NimBLE | `../nimble`（工作区外检出，不入库） | apache/mynewt-nimble | Apache-2.0 |
 
 ## 已知限制与待上板校准项

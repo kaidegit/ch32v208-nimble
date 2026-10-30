@@ -3,8 +3,8 @@
  *
  * Lives in config/ so that BOTH nimble_core (which includes this header from
  * nimble/host/src/ble_gatts_lcl.c) and wch_ble see it through the shared
- * config/ include path.  The implementation is port/console_rtt.c
- * (SEGGER RTT channel 0).
+ * config/ include path.  The implementation is port/console_uart.c
+ * (USART1 DMA ring, shared with EasyLogger and the NPL log sink).
  *
  * API surface kept to what the stack actually uses (grep across
  * nimble/host/src + nimble/controller/src): only console_printf()
@@ -22,13 +22,13 @@
 extern "C" {
 #endif
 
-/* Backend sink implemented in port/console_rtt.c.  Exposed so the NPL log
- * shim (config/nimble/nimble_npl_os_log.h) can share the same RTT path. */
+/* Backend sink implemented in port/console_uart.c.  Exposed so the NPL log
+ * shim (config/nimble/nimble_npl_os_log.h) can share the same UART path. */
 void console_write(const void *data, size_t len);
 int  console_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-/* No-ops kept for source compatibility with app code using the mynewt
- * console API; RTT needs neither setup nor flushing. */
+/* console_init() brings up USART1/DMA/EasyLogger (call wch_log_init()
+ * directly instead); console_flush() is a bounded ring drain. */
 int  console_init(void);
 void console_flush(void);
 

@@ -20,7 +20,7 @@ set(WS_DIR        ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(NIMBLE_DIR    ${WS_DIR}/nimble)                  # apache/mynewt-nimble @ master (1.9.0-dev)
 set(SDK_DIR       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sdk)
 set(FREERTOS_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/freertos)
-set(RTT_DIR       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/segger_rtt)
+set(ELOG_DIR      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/easylogger)
 
 if(NOT EXISTS ${NIMBLE_DIR}/porting)
     message(FATAL_ERROR "nimble checkout not found at ${NIMBLE_DIR}")
@@ -81,16 +81,29 @@ target_include_directories(freertos_kernel PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/config
 )
 
-# ------------------------------------------------------------ SEGGER RTT ---
-# System-call overrides are linked directly into the images below.
-file(GLOB RTT_SRC ${RTT_DIR}/*.c)
-add_library(segger_rtt STATIC ${RTT_SRC})
-target_include_directories(segger_rtt PUBLIC
-    ${RTT_DIR}
+# ------------------------------------------------------------- logger -----
+# EasyLogger core (vendored, see third_party/easylogger/VENDORED.md) plus
+# the platform port: USART1 DMA ring sink, console facade, NimBLE NPL log
+# sink, polled emergency output (port/console_uart.c, port/wch_log.h).
+# config/ comes first on the include path so config/elog_cfg.h shadows the
+# upstream easylogger/inc/elog_cfg.h defaults.
+# elog_async.c (POSIX pthread) and elog_buf.c are NOT compiled: async
+# decoupling is the project's own DMA ring.
+add_library(logger STATIC
+    ${ELOG_DIR}/src/elog.c
+    ${ELOG_DIR}/src/elog_utils.c
+    port/console_uart.c
+)
+target_include_directories(logger PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/port
+    ${ELOG_DIR}/inc
+    ${SDK_DIR}/Peripheral/inc
+    ${SDK_DIR}/Core
     ${FREERTOS_DIR}/include
     ${FREERTOS_DIR}/portable/GCC/RISC-V
-    ${CMAKE_CURRENT_SOURCE_DIR}/config
 )
+target_link_libraries(logger PUBLIC freertos_kernel sdk_periph)
 
 # ------------------------------------------------------------ NimBLE core -
 # host + controller + transport + porting glue (FreeRTOS NPL).
@@ -140,7 +153,6 @@ add_library(wch_ble STATIC
     drivers/wch_ble/ble_hw_wch.c
     port/hal_timer_wch.c
     port/nimble_port_wch.c
-    port/console_rtt.c
     # Software AES-128 + CMAC behind the config/mbedtls/ headers; NimBLE's
     # ble_ll_crypto.c / ble_sm_alg.c include <mbedtls/cmac.h> unconditionally.
     port/crypto_mbedtls_shim.c
@@ -150,7 +162,7 @@ target_include_directories(wch_ble PUBLIC
     port
     ${CMAKE_CURRENT_SOURCE_DIR}/config
 )
-target_link_libraries(wch_ble PUBLIC nimble_core sdk_periph segger_rtt)
+target_link_libraries(wch_ble PUBLIC nimble_core sdk_periph logger)
 # ISR-sensitive code goes into .highcode (see ld/Link.ld)
 set_source_files_properties(drivers/wch_ble/wch_rf.c
     PROPERTIES COMPILE_FLAGS "-fno-builtin")
@@ -175,7 +187,7 @@ target_compile_definitions(ch32v208_nimble PRIVATE
 # port calls ble_ll_*), so the archives must be rescanned as a group.
 target_link_libraries(ch32v208_nimble
     PRIVATE -Wl,--start-group
-            wch_ble nimble_core sdk_periph freertos_kernel segger_rtt
+            wch_ble nimble_core sdk_periph freertos_kernel logger
             -Wl,--end-group)
 target_include_directories(ch32v208_nimble PRIVATE app port)
 target_link_options(ch32v208_nimble PRIVATE
@@ -193,7 +205,7 @@ add_custom_command(TARGET ch32v208_nimble POST_BUILD
     VERBATIM
 )
 
-# Bring-up image: startup + clock + FreeRTOS + RTT banner only
+# Bring-up image: startup + clock + FreeRTOS + UART log banner only
 # (main.c's app_ble_start() has a weak default; used to validate the
 #  toolchain/boot path before the BLE stack is linked in).
 add_executable(boot
@@ -204,7 +216,7 @@ add_executable(boot
     ${SDK_DIR}/Startup/startup_ch32v20x_D8W.S
 )
 set_target_properties(boot PROPERTIES SUFFIX ".elf")
-target_link_libraries(boot PRIVATE sdk_periph freertos_kernel segger_rtt)
+target_link_libraries(boot PRIVATE sdk_periph freertos_kernel logger)
 target_include_directories(boot PRIVATE app port)
 target_link_options(boot PRIVATE
     -T${CMAKE_CURRENT_SOURCE_DIR}/ld/Link.ld

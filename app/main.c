@@ -5,7 +5,7 @@
  * and in machine mode with interrupts masked until the scheduler starts.
  *
  * Responsibilities:
- *  - refresh SystemCoreClock, init SEGGER RTT and print the boot banner
+ *  - refresh SystemCoreClock, init the UART log backend and print the boot banner
  *  - start the FreeRTOS scheduler with a single "app" task
  *  - app_ble_start() is a weak no-op here; the strong version in
  *    app/app_ble.c (other agent) brings up NimBLE when the full image
@@ -20,7 +20,10 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
-#include "SEGGER_RTT.h"
+#include "console/console.h"
+#define LOG_TAG  "boot"
+#include "elog.h"
+#include "wch_log.h"
 #include "ch32v20x.h"
 
 /* Linker-provided boundaries (ld/Link.ld). */
@@ -103,8 +106,8 @@ void app_ble_start( void )
 void vApplicationMallocFailedHook( void )
 {
     taskDISABLE_INTERRUPTS();
-    SEGGER_RTT_printf( 0, "\r\n[malloc-failed] heap exhausted in task %s\r\n",
-                       pcTaskGetName( NULL ) );
+    wch_log_panic( "\r\n[malloc-failed] heap exhausted in task %s\r\n",
+                   pcTaskGetName( NULL ) );
     for( ;; )
     {
     }
@@ -122,25 +125,25 @@ void vApplicationStackOverflowHook( TaskHandle_t xTask, char * pcTaskName )
 
     taskDISABLE_INTERRUPTS();
     /* hw = words of intact A5 fill from the stack base. */
-    SEGGER_RTT_printf( 0, "\r\n[stack-overflow] task: %s, hw=%uw, heap_free=%u, sp=%x\r\n",
-                       pcTaskName,
-                       ( unsigned ) uxTaskGetStackHighWaterMark( xTask ),
-                       ( unsigned ) xPortGetFreeHeapSize(),
-                       ( unsigned ) sp );
+    wch_log_panic( "\r\n[stack-overflow] task: %s, hw=%uw, heap_free=%u, sp=%x\r\n",
+                   pcTaskName,
+                   ( unsigned ) uxTaskGetStackHighWaterMark( xTask ),
+                   ( unsigned ) xPortGetFreeHeapSize(),
+                   ( unsigned ) sp );
     if( xTask == xAppTaskHandle )
     {
-        SEGGER_RTT_printf( 0, "lo  : %x %x %x %x %x %x %x %x\r\n",
-                           lo[ 0 ], lo[ 1 ], lo[ 2 ], lo[ 3 ],
-                           lo[ 4 ], lo[ 5 ], lo[ 6 ], lo[ 7 ] );
-        SEGGER_RTT_printf( 0, "base: %x %x %x %x %x %x %x %x\r\n",
-                           base[ 0 ], base[ 1 ], base[ 2 ], base[ 3 ],
-                           base[ 4 ], base[ 5 ], base[ 6 ], base[ 7 ] );
-        SEGGER_RTT_printf( 0, "top : %x %x %x %x %x %x %x %x\r\n",
-                           top[ 0 ], top[ 1 ], top[ 2 ], top[ 3 ],
-                           top[ 4 ], top[ 5 ], top[ 6 ], top[ 7 ] );
-        SEGGER_RTT_printf( 0, "hi  : %x %x %x %x %x %x %x %x\r\n",
-                           hi[ 0 ], hi[ 1 ], hi[ 2 ], hi[ 3 ],
-                           hi[ 4 ], hi[ 5 ], hi[ 6 ], hi[ 7 ] );
+        wch_log_panic( "lo  : %x %x %x %x %x %x %x %x\r\n",
+                       ( unsigned ) lo[ 0 ], ( unsigned ) lo[ 1 ], ( unsigned ) lo[ 2 ], ( unsigned ) lo[ 3 ],
+                       ( unsigned ) lo[ 4 ], ( unsigned ) lo[ 5 ], ( unsigned ) lo[ 6 ], ( unsigned ) lo[ 7 ] );
+        wch_log_panic( "base: %x %x %x %x %x %x %x %x\r\n",
+                       ( unsigned ) base[ 0 ], ( unsigned ) base[ 1 ], ( unsigned ) base[ 2 ], ( unsigned ) base[ 3 ],
+                       ( unsigned ) base[ 4 ], ( unsigned ) base[ 5 ], ( unsigned ) base[ 6 ], ( unsigned ) base[ 7 ] );
+        wch_log_panic( "top : %x %x %x %x %x %x %x %x\r\n",
+                       ( unsigned ) top[ 0 ], ( unsigned ) top[ 1 ], ( unsigned ) top[ 2 ], ( unsigned ) top[ 3 ],
+                       ( unsigned ) top[ 4 ], ( unsigned ) top[ 5 ], ( unsigned ) top[ 6 ], ( unsigned ) top[ 7 ] );
+        wch_log_panic( "hi  : %x %x %x %x %x %x %x %x\r\n",
+                       ( unsigned ) hi[ 0 ], ( unsigned ) hi[ 1 ], ( unsigned ) hi[ 2 ], ( unsigned ) hi[ 3 ],
+                       ( unsigned ) hi[ 4 ], ( unsigned ) hi[ 5 ], ( unsigned ) hi[ 6 ], ( unsigned ) hi[ 7 ] );
     }
     for( ;; )
     {
@@ -153,22 +156,23 @@ void vApplicationStackOverflowHook( TaskHandle_t xTask, char * pcTaskName )
  * Every bring-up step calls app_dbg_chk(tag).  It fingerprints five
  * canaries at once: pxCurrentTCB (kernel slot @0x2000036C, the word the
  * tick handler dereferences), the unused WCH whitelist (64 B of .bss
- * that nothing writes before a whitelist op), the RTT control-block ID
- * ("SEGGER RTT" - probe-rs saw channel descriptors damaged), and the
+ * that nothing writes before a whitelist op), the log ring tripwires
+ * (g_wch_log_canary_lo/hi bracket the DMA ring in port/console_uart.c -
+ * the replacement for the old RTT control-block ID check), and the
  * g_app_zone tripwires.  On any anomaly it dumps the kernel-variable
  * neighborhood around pxCurrentTCB so the spray shape is visible.
  */
 extern void * volatile pxCurrentTCB;       /* FreeRTOS tasks.c            */
 extern uint32_t g_wch_whitelist[];         /* ble_hw_wch.c canary, 64 B   */
-/* _SEGGER_RTT comes from SEGGER_RTT.h (already included): ID string is
- * the 16-byte sName[] at offset 0. */
+/* g_wch_log_canary_lo/hi come from wch_log.h (console_uart.c). */
+
+#define LOG_CANARY_WORD    ( 0x5A5AA5A5UL )
 
 void app_dbg_chk( const char * tag )
 {
     volatile uint32_t * slot = ( volatile uint32_t * ) &pxCurrentTCB;
     uint32_t tcb = *slot;
-    static const char rtt_id[] = "SEGGER RTT";
-    int wl_bad = 0, rtt_bad = 0, zlo_bad = 0, zhi_bad = 0;
+    int wl_bad = 0, ring_bad = 0, zlo_bad = 0, zhi_bad = 0;
     int i;
 
     for( i = 0; i < 16; i++ )
@@ -179,11 +183,12 @@ void app_dbg_chk( const char * tag )
             break;
         }
     }
-    for( i = 0; i < 10; i++ )
+    for( i = 0; i < 4; i++ )
     {
-        if( _SEGGER_RTT.acID[ i ] != rtt_id[ i ] )
+        if( ( g_wch_log_canary_lo[ i ] != LOG_CANARY_WORD ) ||
+            ( g_wch_log_canary_hi[ i ] != LOG_CANARY_WORD ) )
         {
-            rtt_bad = 1;
+            ring_bad = 1;
             break;
         }
     }
@@ -204,38 +209,40 @@ void app_dbg_chk( const char * tag )
         }
     }
 
-    if( ( tcb != ( uint32_t ) &xAppTaskTCB ) || wl_bad || rtt_bad ||
+    if( ( tcb != ( uint32_t ) &xAppTaskTCB ) || wl_bad || ring_bad ||
         zlo_bad || zhi_bad )
     {
-        SEGGER_RTT_printf( 0, "chk[%s]: tcb=%08x wl=%d rtt=%d z=%d%d\r\n",
-                           tag, (unsigned)tcb, wl_bad, rtt_bad, zlo_bad, zhi_bad );
+        console_printf( "chk[%s]: tcb=%08x wl=%d ring=%d z=%d%d\r\n",
+                        tag, (unsigned)tcb, wl_bad, ring_bad, zlo_bad, zhi_bad );
         volatile uint32_t * p = slot - 12;
 
         for( i = 0; i < 6; i++, p += 4 )
         {
-            SEGGER_RTT_printf( 0, "  %08x: %08x %08x %08x %08x\r\n",
-                               ( unsigned ) ( uintptr_t ) p,
-                               ( unsigned ) p[ 0 ], ( unsigned ) p[ 1 ],
-                               ( unsigned ) p[ 2 ], ( unsigned ) p[ 3 ] );
+            console_printf( "  %08x: %08x %08x %08x %08x\r\n",
+                            ( unsigned ) ( uintptr_t ) p,
+                            ( unsigned ) p[ 0 ], ( unsigned ) p[ 1 ],
+                            ( unsigned ) p[ 2 ], ( unsigned ) p[ 3 ] );
         }
-        SEGGER_RTT_printf( 0, "  wl : %08x %08x %08x %08x\r\n",
-                           ( unsigned ) g_wch_whitelist[ 0 ],
-                           ( unsigned ) g_wch_whitelist[ 1 ],
-                           ( unsigned ) g_wch_whitelist[ 2 ],
-                           ( unsigned ) g_wch_whitelist[ 3 ] );
-        SEGGER_RTT_printf( 0, "  rtt: %08x %08x %08x %08x\r\n",
-                           ( unsigned ) *( volatile uint32_t * ) &_SEGGER_RTT.acID[ 0 ],
-                           ( unsigned ) *( volatile uint32_t * ) &_SEGGER_RTT.acID[ 4 ],
-                           ( unsigned ) *( volatile uint32_t * ) &_SEGGER_RTT.acID[ 8 ],
-                           ( unsigned ) *( volatile uint32_t * ) &_SEGGER_RTT.acID[ 12 ] );
+        console_printf( "  wl : %08x %08x %08x %08x\r\n",
+                        ( unsigned ) g_wch_whitelist[ 0 ],
+                        ( unsigned ) g_wch_whitelist[ 1 ],
+                        ( unsigned ) g_wch_whitelist[ 2 ],
+                        ( unsigned ) g_wch_whitelist[ 3 ] );
+        console_printf( "  rng: lo=%08x hi=%08x\r\n",
+                        ( unsigned ) g_wch_log_canary_lo[ 0 ],
+                        ( unsigned ) g_wch_log_canary_hi[ 0 ] );
     }
 }
 
 /*********************************************************************
  * app task: BLE bring-up hook, then a 1 s heartbeat with uptime ticks.
  *********************************************************************/
+#undef LOG_TAG
+#define LOG_TAG  "app"
+
 static void app_task( void * pvParameters )
 {
+    struct wch_log_stats stats;
     ( void ) pvParameters;
 
     app_ble_start(); /* no-op while linked against the weak default */
@@ -243,12 +250,22 @@ static void app_task( void * pvParameters )
     for( ;; )
     {
         vTaskDelay( pdMS_TO_TICKS( 1000 ) );
-        SEGGER_RTT_printf( 0, "[app] alive, uptime=%u ticks, sysclk=%u, stk_hw=%uw\r\n",
-                           ( unsigned ) xTaskGetTickCount(),
-                           ( unsigned ) SystemCoreClock,
-                           ( unsigned ) uxTaskGetStackHighWaterMark( NULL ) );
+        wch_log_get_stats( &stats );
+        log_i( "alive, uptime=%u ticks, sysclk=%u, stk_hw=%uw, "
+               "log drop=%u/%uB dma_err=%u dead=%u panic=%u",
+               ( unsigned ) xTaskGetTickCount(),
+               ( unsigned ) SystemCoreClock,
+               ( unsigned ) uxTaskGetStackHighWaterMark( NULL ),
+               ( unsigned ) stats.drop_msgs, ( unsigned ) stats.drop_bytes,
+               ( unsigned ) stats.dma_errors, ( unsigned ) stats.dma_dead,
+               ( unsigned ) stats.panic_mode );
     }
 }
+
+/* Back to the boot tag for main()'s banner (macros use the definition
+ * visible at each call site). */
+#undef LOG_TAG
+#define LOG_TAG  "boot"
 
 int main( void )
 {
@@ -259,51 +276,52 @@ int main( void )
      * Do not inherit an enabled LSI from a previous firmware. */
     RCC->RSTSCKR &= ~RCC_LSION;
 
-    SEGGER_RTT_Init();
+    /* USART1 + DMA1_CH4 + EasyLogger (port/console_uart.c). */
+    wch_log_init();
 
-    SEGGER_RTT_WriteString( 0, "\r\n==============================\r\n" );
-    SEGGER_RTT_printf( 0, "CH32V208 NimBLE bring-up\r\n" );
-    SEGGER_RTT_printf( 0, "build   : %s %s\r\n", __DATE__, __TIME__ );
-    SEGGER_RTT_printf( 0, "sysclk  : %u Hz\r\n", ( unsigned ) SystemCoreClock );
-    SEGGER_RTT_printf( 0, "osc     : HSE(on/ready)=%u/%u LSE=%u/%u LSI=%u/%u\r\n",
-                       !!( RCC->CTLR & RCC_HSEON ), !!( RCC->CTLR & RCC_HSERDY ),
-                       !!( RCC->BDCTLR & RCC_LSEON ), !!( RCC->BDCTLR & RCC_LSERDY ),
-                       !!( RCC->RSTSCKR & RCC_LSION ), !!( RCC->RSTSCKR & RCC_LSIRDY ) );
-    SEGGER_RTT_printf( 0, "kernel  : FreeRTOS %s, tick %d Hz\r\n",
-                       tskKERNEL_VERSION_NUMBER, ( int ) configTICK_RATE_HZ );
-    SEGGER_RTT_printf( 0, "heap    : FreeRTOS %u B + newlib [%p..%p] (%u B)\r\n",
-                       ( unsigned ) configTOTAL_HEAP_SIZE,
-                       ( void * ) _heap_start, ( void * ) _heap_end,
-                       ( unsigned ) ( _heap_end - _heap_start ) );
-    SEGGER_RTT_printf( 0, "stack   : %p..%p\r\n",
-                       ( void * ) _susrstack, ( void * ) _eusrstack );
+    log_i( "==============================" );
+    log_i( "CH32V208 NimBLE bring-up" );
+    log_i( "build   : %s %s", __DATE__, __TIME__ );
+    log_i( "sysclk  : %u Hz", ( unsigned ) SystemCoreClock );
+    log_i( "osc     : HSE(on/ready)=%u/%u LSE=%u/%u LSI=%u/%u",
+           !!( RCC->CTLR & RCC_HSEON ), !!( RCC->CTLR & RCC_HSERDY ),
+           !!( RCC->BDCTLR & RCC_LSEON ), !!( RCC->BDCTLR & RCC_LSERDY ),
+           !!( RCC->RSTSCKR & RCC_LSION ), !!( RCC->RSTSCKR & RCC_LSIRDY ) );
+    log_i( "kernel  : FreeRTOS %s, tick %d Hz",
+           tskKERNEL_VERSION_NUMBER, ( int ) configTICK_RATE_HZ );
+    log_i( "heap    : FreeRTOS %u B + newlib [%p..%p] (%u B)",
+           ( unsigned ) configTOTAL_HEAP_SIZE,
+           ( void * ) _heap_start, ( void * ) _heap_end,
+           ( unsigned ) ( _heap_end - _heap_start ) );
+    log_i( "stack   : %p..%p",
+           ( void * ) _susrstack, ( void * ) _eusrstack );
     /* Memory split actually loaded by the chip (RM ch.32): FLASH_OBR[9:7]
      * RAM_CODE_MOD - 00x=CODE-128K+RAM-64K, 01x=144K+48K, 1xx=160K+32K;
      * ESIG F_SIZE @0x1FFFF7E0 = usable code flash in KB.  The ld assumes
      * 128K zero-wait code window + 64K SRAM - verify, don't trust. */
-    SEGGER_RTT_printf( 0, "memcfg  : OBR=%08x ram_code_mod=%u fsize=%uK\r\n",
-                       ( unsigned ) *( volatile uint32_t * ) 0x4002201CUL,
-                       ( unsigned ) ( ( *( volatile uint32_t * ) 0x4002201CUL >> 7 ) & 0x7UL ),
-                       ( unsigned ) *( volatile uint16_t * ) 0x1FFFF7E0UL );
+    log_i( "memcfg  : OBR=%08x ram_code_mod=%u fsize=%uK",
+           ( unsigned ) *( volatile uint32_t * ) 0x4002201CUL,
+           ( unsigned ) ( ( *( volatile uint32_t * ) 0x4002201CUL >> 7 ) & 0x7UL ),
+           ( unsigned ) *( volatile uint16_t * ) 0x1FFFF7E0UL );
     /* INTSYSCR (CSR 0x804): confirm the startup's HPE/nesting configuration -
      * startup_ch32v20x_D8W.S writes 0 (nesting and HPE off). */
     {
         uint32_t intsyscr;
 
         __asm__ volatile ( "csrr %0, 0x804" : "=r"( intsyscr ) );
-        SEGGER_RTT_printf( 0, "intcfg  : INTSYSCR=%08x nest=%u hpe=%u\r\n",
-                           ( unsigned ) intsyscr,
-                           ( unsigned ) ( ( intsyscr >> 1 ) & 1UL ),
-                           ( unsigned ) ( intsyscr & 1UL ) );
+        log_i( "intcfg  : INTSYSCR=%08x nest=%u hpe=%u",
+               ( unsigned ) intsyscr,
+               ( unsigned ) ( ( intsyscr >> 1 ) & 1UL ),
+               ( unsigned ) ( intsyscr & 1UL ) );
     }
     /* 96-bit factory UID - provenance data for the deterministic garbage
      * values written into RAM (is the junk derived from chip-fixed data?). */
-    SEGGER_RTT_printf( 0, "uid    : %08x %08x %08x\r\n",
-                       ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7E8UL,
-                       ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7ECUL,
-                       ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7F0UL );
+    log_i( "uid    : %08x %08x %08x",
+           ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7E8UL,
+           ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7ECUL,
+           ( unsigned ) *( volatile uint32_t * ) 0x1FFFF7F0UL );
 
-    SEGGER_RTT_WriteString( 0, "==============================\r\n" );
+    log_i( "==============================" );
 
     /* Static task inside g_app_zone: stack corruption forensics (see the
      * zone comment above; depth itself is measured adequate - max frame in
@@ -320,7 +338,7 @@ int main( void )
                                         &xAppTaskTCB );
     if( xAppTaskHandle == NULL )
     {
-        SEGGER_RTT_WriteString( 0, "[main] xTaskCreateStatic(app) failed\r\n" );
+        log_e( "xTaskCreateStatic(app) failed" );
         for( ;; )
         {
         }
@@ -330,7 +348,7 @@ int main( void )
 
     /* Only returns if the kernel ran out of heap before the first task
      * could be scheduled. */
-    SEGGER_RTT_WriteString( 0, "[main] vTaskStartScheduler returned\r\n" );
+    log_e( "vTaskStartScheduler returned" );
     for( ;; )
     {
     }
