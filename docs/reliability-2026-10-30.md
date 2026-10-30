@@ -48,6 +48,52 @@ Mac客户端持续轮换0,1,2,3,4,5,7,16,20,23,31,32,63,64字节及变化的数�
 完整报告记录ELF和客户端源码SHA256、Git版本及工作区变更；每次读写原始事件
 保存在独立JSONL。具体命令见`tools/macos-ble/README.md`。
 
-## 执行结果（进行中）
+## 完成结果
 
-修复版的`reliability-fixed-full`已通过30次连续软件复位，正在执行其余阶段。
+修复版完整脚本与额外回卷脚本均通过，期间未自动重试：
+
+| 阶段 | 实测结果 |
+|---|---|
+| 软件复位后连接读写 | 30/30通过 |
+| 不复位反复重连，交替1M/2M | 100/100通过 |
+| 1M单连接 | 1800.35秒，3861轮，74637字节回读通过 |
+| 2M单连接 | 1800.26秒，3856轮，74540字节回读通过 |
+| 额外2M单连接，不复位 | 1200.39秒，2574轮，49737字节回读通过 |
+
+三个持续连接阶段共10291轮、198914字节逐字节回读校验，未出现意外断连、
+读写错误、数据不符、PHY改变或客户端看门狗超时。最长一轮分别0.361/0.363/0.334秒。
+独立复核原始JSONL：回读内容与当轮写入一致，回读次数、PHY确认次数与汇总轮数相等，
+各阶段uptime分别推进1800/1800/1200秒，与客户端单调时长一致。
+这验证了当前板和Mac的应用层互通，不等于测得零空口丢包或最大吞吐。
+
+最后一次GDB只读快照位于整个长测结束之后：
+
+- `xTickCount=5084003`：约84.7分钟；`TIM3 high_word=77578>65535`，
+  确认1MHz 32位cputime已经自然回卷一次，之后仍完成数据回读。
+- TX启动/完成161027/161027，TX失败/迟到0；CRC正确RX159284。
+  其中1M TX62812、RX61215；2M TX98215、RX98069。
+- RX CRC错误192、空窗口超时11041，均为硬件接收计数；没有把它们描述为零丢包。
+  `radio_state_errs/no_bufs/hw_errs`均0，异常stash与assert均0。
+- VCO ready_mask7、expired_mask0。FreeRTOS当前/历史最低空闲堆均13808字节；
+  newlib bump heap使用216字节（`0x2000b5b8-0x2000b4e0`）。
+
+固件实现提交`66ec015`，测试ELF SHA256：
+`d79f46c516b62f9af907ff601b91f1ca859517539dc17e0dc7c8e1bb3d166204`。
+首个完整脚本启动于提交前，报告保留当时HEAD与工作区变更，而后续额外测试报告
+记录`66ec015`；两个报告的ELF哈希相同，没有在长测中途重烧或重启。
+
+报告及原始证据：
+
+- `tools/macos-ble/.build/reliability-fixed-full/report.json`：132个测试项全部通过。
+- `tools/macos-ble/.build/reliability-wrap/report.json`：额外1200秒2M通过。
+- `tools/macos-ble/.build/reliability-soak-audit.json`：原始日志独立复核汇总。
+- `tools/macos-ble/.build/reliability-final.gdb.txt`和`reliability-final.ram.bin`：
+  末次GDB及64KB RAM；GDB采样前从末次复位起未暂停CPU。
+
+当前仍采用软件IFS与当前96MHz板校准值。未验证物理断电、温度/距离极限、
+coded PHY、其他中心设备、配对/加密和最大吞吐，不能把本轮结果扩大为完整BLE认证。
+
+
+完成取证后退出GDB、正常reset，再在同一连接内以1M和2M分别完成6字节回读，
+`reliability-final-restore.jsonl`为`probe_complete`、exit0，耗时3.71秒。
+客户端正常断开，板子恢复广播；当前仍是独立静态随机测试地址构建，设备名不变。
