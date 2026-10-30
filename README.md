@@ -10,7 +10,7 @@
 当前固件可独立复位运行，Mac已完成扫描、服务发现、uptime读取和echo写入回读实测。
 1M/2M均已完成显式PHY确认和64字节写入回读，同连接1M→2M通过；
 本机Mac对2M→1M请求回复no-change。详见[速率测试记录](docs/phy-rates-2026-10-30.md)。
-可靠性复测已完成：30次复位、100次重连，1M/2M各30分钟及额外2M20分钟均通过；
+旧108us镜像的可靠性复测曾通过：30次复位、100次重连，1M/2M各30分钟及额外2M20分钟；
 累计10291轮回读校验，覆盖约71.6分钟的cputime回卷。复位VCO超时误报已修复。
 详见[可靠性测试记录](docs/reliability-2026-10-30.md)。coded PHY和仪器级时序仍未验证。
 macOS 测试客户端见 [tools/macos-ble](tools/macos-ble/README.md)。
@@ -19,9 +19,46 @@ Android 手机互通排查及 RX→TX 软件等待调整见
 [ADB 手机工具](tools/android-ble/README.md)直接操作现有 nRF Connect，保留用户过滤器。
 旧逆向笔记和下方历史表包含已推翻的寄存器解释，新增驱动修改必须核对原厂指令。
 最新日志适配与手机短测见[UART DMA复核记录](docs/uart-review-2026-10-30.md)。
-上面的84分钟结果属于旧108us镜像；当前仍保留独立运行队列故障的取证点，尚未重新完成长测。
+**当前120us + UART镜像仅完成手机连接、三个服务发现、1M/2M回读、PHY切换及重连短测。
+此前脱机运行捕获的队列自环尚未证明根因消失，当前版本尚未重新完成长测，不能据此宣称BLE已完全稳定。**
 
 **项目定位**：用 Apache NimBLE（controller + host 全开源）直接驱动 CH32V208 的蓝牙硬件，验证/测试该芯片的 BLE 功能。RF/BB/LLE 寄存器级驱动逆向自 WCH 闭源库 `libwchble.a`（见 [WCH_BLE_LIB_RE_FINDINGS.md](../../WCH_BLE_LIB_RE_FINDINGS.md)），**不用 WCH 闭源协议栈、不用 TMOS**。CMake 构建，FreeRTOS + NimBLE NPL(freertos)，probe-rs + WCH-LinkE 烧录/停机取证，EasyLogger + USART1 DMA 日志。
+
+## 已踩坑：RTT读取会暂停CPU，干扰BLE时序
+
+**本板CH32V208WBU6 + WCH-LinkE + probe-rs 0.32的RTT读取不是无停机访存。
+BLE运行测试使用串口日志，不附加RTT或GDB。** RTT协议本身并不要求暂停CPU，问题在于本板调试模块提供的访存能力及实际采用的访问路径。
+
+已保存的probe-rs trace记录到以下关键值和访问方式：
+
+```text
+DMI 0x38 (sbcs) = 0x00000000
+sbasize = 0; sbaccess8/16/32/64/128 = false
+read_multiple(A32) from 0x2000b400 using ProgramBuffer
+```
+
+`sbasize=0`按[RISC-V Debug Spec 0.13.2 §3.12.18](https://riscv.org/wp-content/uploads/2024/12/riscv-debug-release.pdf)
+表示没有System Bus Access（SBA）支持；不能仅凭`sbversion=0`判断，因为该值本身表示旧版接口。
+工作区的《青稞V4微处理器手册》V1.5 §7.1（表7-1）也未列出SBA寄存器，描述的是暂停后的抽象命令/Program Buffer访问。
+[probe-rs 0.32源码](https://github.com/probe-rs/probe-rs/blob/v0.32.0/probe-rs/src/architecture/riscv/communication_interface.rs)
+仅对支持的SBA能力选择SystemBus路径；本板实际回退到ProgramBuffer，单次和批量读取都经过
+`halted_access`：暂停CPU、借用寄存器并执行访存指令、恢复寄存器，若之前在运行则恢复运行。
+这个回退行为符合当前能力探测结果，没有证据表明是probe-rs误配置SBA。
+
+持续RTT轮询会反复暂停CPU，破坏BLE微秒级收发调度。实测曾出现心跳仍在输出、RF发送失败不断累积、
+手机连接失败的组合，不能用“还有日志”证明空口正常。另一个独立问题是probe-rs attach默认会把RTT通道
+设成`block-if-full`，读端停滞时还可能阻塞固件日志。显式`no-block-skip`只解决环形缓冲区满时的阻塞，
+**不能消除ProgramBuffer访问导致的CPU暂停**；降低轮询频率或批量读取也不能保证BLE时序。
+
+当前处理方式：
+
+- EasyLogger/console/NPL/newlib日志统一走USART1 DMA：PA9 TX、PA10 RX，921600、8N1、无流控；固件不再链接RTT。
+- `scripts/run.sh`只烧录和复位；`scripts/log.sh`读取串口，`scripts/attach.sh`是其兼容入口，不打开调试探针。
+- GDB仅用于停机或故障后的取证。结束调试后停止调试会话并正常复位，再做独立运行的BLE验证；取证继续依赖异常寄存器暂存和RAM记录。
+
+本结论针对已验证的板子和调试路径；没有据此验证所有WCH官方工具或私有接口的行为，也不能把脱机发生的
+队列自环归因于RTT。完整现场见[手机互通记录](docs/android-interop-2026-10-30.md#已确认rtt传输会暂停cpu)，
+串口替代方案的实机结果见[UART DMA复核记录](docs/uart-review-2026-10-30.md)。
 
 ## 架构
 
@@ -102,11 +139,11 @@ probe-rs reset --chip CH32V208WBU6
 
 | 阶段 | 内容 | 怎么算过 |
 |---|---|---|
-| **S0** | boot 路径：startup→时钟→FreeRTOS→RTT banner（`boot` 目标） | `scripts/run.sh` 能看到 RTT 输出 startup/时钟/任务启动 banner，无 HardFault；gdb attach 可停在 main |
+| **S0** | boot 路径：startup→时钟→FreeRTOS→UART banner（`boot` 目标） | 烧录复位后，`scripts/log.sh`能看到startup/时钟/任务启动banner，无异常；需要停机检查时再用GDB |
 | **S1** | RF 基础：`wch_rf_init`、RFEND TXCtune 三频点校准日志、空闲 RSSI 读数（BB+0x30 bits[22:15]） | 校准日志给出低/中/高三频点 tCtune 值且逐次上电一致；屏蔽罩下读 RSSI 为饱和负值，靠近 2.4G 干扰源数值变化 |
 | **S2** | DTM 发射：HCI_LE_Transmitter_Test（经 host HCI 或直接调 RF 原语定频发射） | nRF Connect/频谱仪在指定信道看到稳定载波/调制包；功率与频偏在 CH32V208 规格内（数据手册典型值） |
 | **S3** | legacy 广播：本工程固件上电广播 "CH32V208-NIMBLE" | 手机 nRF Connect 扫描到设备名与厂商字段（0xFF, 'W','C'）；`ble_gap_adv_start` 无错误返回；可被连接 |
-| **S4** | GATT + MTU：连接后交换 MTU，读 uptime 特征、写 echo 特征 | 连接日志打印 conn itvl/latency/timeout；MTU 事件打印（≥23）；读回 4 字节 uptime 递增；写任意 hex 后 RTT 打印 hex dump 且回读一致；断开后自动恢复广播 |
+| **S4** | GATT + MTU：连接后交换 MTU，读 uptime 特征、写 echo 特征 | 连接日志打印 conn itvl/latency/timeout；MTU 事件打印（≥23）；读回 4 字节 uptime 递增；写任意 hex 后UART打印hex dump且回读一致；断开后自动恢复广播 |
 | **S5** | 吞吐/稳定性：长时间连接 + notify/写压测，周期校准验证 | ≥30 min 连接不掉线、无 host reset 回调；周期校准定时器日志按时触发且 RSSI 无漂移异常；丢包率符合预期 |
 
 ## 寄存器速查（BB/LLE/RFEND/AES）
@@ -187,7 +224,7 @@ probe-rs reset --chip CH32V208WBU6
 ## 已知限制与待上板校准项
 
 - **镜像逼近 128K 零等待窗口**：RAM_CODE_MOD=000（出厂默认）时 CODE 区仅 128 K，当前镜像 ~130 K、余量 <1 K；继续增长将跨入非零等待区（可执行但慢），届时按 RM 32.3 开 `FLASH_CTLR.EHMOD`，擦写/停止模式前退出（详见"Flash / SRAM 配置"节）。
-- **LLE[0x1C]/[0x64] 单位未实测**：超时/自旋计数按逆向推断的 LLE tick 使用，上板后需用逻辑分析仪/RTT 计时校准（RE findings §3.2、§4.3）。
+- **LLE[0x1C]/[0x64] 单位未实测**：超时/自旋计数按逆向推断的 LLE tick 使用，上板后需用逻辑分析仪计时校准（RE findings §3.2、§4.3）；不能用会暂停CPU的RTT路径做时序校准。
 - **auto-ack 未启用**：v1 收发走手动模式字序列（BB[0x2C] arm 位留待 S3 后开启自动应答）。
 - **RNG 非安全熵源**：控制器随机数来自硬件 LFSR 类源，可用于地址生成，**不可**作为配对/加密密钥熵源（SM v1 未启用，见下）。
 - **privacy / coded PHY 关闭**：legacy广播使用1M；连接支持1M/2M，默认偏好1M，可通过测试服务切换。地址默认public；`CH32_BLE_TEST_IDENTITY=ON`可使用独立静态随机测试地址以重新发现GATT数据库。

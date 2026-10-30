@@ -146,9 +146,9 @@ TX失败路径原先只改软件IDLE，现保存首次错误的CMD/IRQ/window/BB
 因此当前RTT路径会干扰BLE时序，`no-block-skip`并不消除CPU暂停。该证据解释了
 运行时日志附加的侵入性，但不能单独解释所有脱机故障。
 
-`run.sh`现在只烧录、正常复位，不自动附加RTT。日志将按用户要求交给另一个agent
-迁移为EasyLogger + USART1(PA9/PA10)、921600 + DMA，当前尚未实现串口迁移。
-不采用原厂阻塞SDI `_write()`。
+`run.sh`现在只烧录、正常复位，不自动附加RTT。后续已完成EasyLogger +
+USART1(PA9/PA10)、921600 + DMA迁移，实机结果见[UART DMA复核记录](uart-review-2026-10-30.md)。
+`log.sh`和`attach.sh`读取串口，不采用原厂阻塞SDI `_write()`。
 
 时钟实读：HSE on/ready=1/1，LSE=0/0，LSI=0/0；96MHz主频及TIM3 1MHz计时来自
 32MHz HSE。启动显式关闭LSI，不新增RTC/低速RC依赖。SCA预算改为SDK外晶体路径
