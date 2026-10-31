@@ -26,6 +26,16 @@
 /* host: vendored syscfg.h:1075 already defaults to 1; kept explicit. */
 #define MYNEWT_VAL_BLE_HOST (1)
 
+/* One LE credit-based echo channel in addition to ATT/SM/signalling. */
+#define MYNEWT_VAL_BLE_L2CAP_COC_MAX_NUM (1)
+#define MYNEWT_VAL_BLE_L2CAP_MAX_CHANS (4)
+/* One LE frame plus its 4-byte L2CAP header fits a 251-byte ACL packet. */
+#define MYNEWT_VAL_BLE_L2CAP_COC_MPS (247)
+#define MYNEWT_VAL_MSYS_1_BLOCK_COUNT (24)
+/* Native HCI has no separate ACL pool. Let the shared MSYS reserve, rather
+ * than the default ten logical controller credits, bound the TX queue. */
+#define MYNEWT_VAL_BLE_TRANSPORT_ACL_FROM_HS_COUNT (24)
+
 /* ----------------------------------------------------------- transport ----
  * transport/syscfg.yml:22-50: BLE_TRANSPORT_HS / BLE_TRANSPORT_LL choices.
  * "native" == host and controller run on the same core, HCI goes through
@@ -39,10 +49,11 @@
  * HS__cdc/custom/dialog_cmac/nrf5340/uart/usb = 0 (syscfg.h:1510-1529),
  * LL__apollo3/custom/dialog_cmac/emspi/nrf5340/uart_ll = 0 (syscfg.h:1551-1573).
  *
- * MSYS / transport pools: 沿用 vendored 默认
- *   MSYS_1: 12 blocks x 292 B (syscfg.h:402-407)  - covers 251 B ACL + overhead
+ * MSYS / transport pools: throughput overrides above, other values default
+ *   MSYS_1: 24 blocks x 292 B (syscfg.h:402-407)  - covers 251 B ACL + overhead
  *   MSYS_2: disabled        (syscfg.h:414-419)
- *   BLE_TRANSPORT_ACL_COUNT=10/251B, EVT_COUNT=4, EVT_DISCARDABLE_COUNT=16,
+ *   BLE_TRANSPORT_ACL_FROM_HS_COUNT=24, ACL_SIZE=251; EVT_COUNT=4,
+ *   EVT_DISCARDABLE_COUNT=16,
  *   EVT_SIZE=70 (syscfg.h:1490-1507; also transport/syscfg.yml:52-89)
  * With HS__native && LL__native the transport ACL/ISO pools are compiled out
  * (transport.c POOL_ACL_COUNT=0), so these defaults are only RAM-light.
@@ -112,7 +123,7 @@
 #define MYNEWT_VAL_BLE_LL_MAX_PKT_SIZE (251)            /* yml:131-133 */
 #define MYNEWT_VAL_BLE_LL_SUPP_MAX_RX_BYTES (251)       /* yml:134-136 */
 #define MYNEWT_VAL_BLE_LL_SUPP_MAX_TX_BYTES (251)       /* yml:137-139 */
-#define MYNEWT_VAL_BLE_LL_CONN_INIT_MAX_TX_BYTES (27)   /* yml:140-145 */
+#define MYNEWT_VAL_BLE_LL_CONN_INIT_MAX_TX_BYTES (251)  /* Request full DLE; 27 disables automatic expansion. */
 #define MYNEWT_VAL_BLE_LL_CONN_INIT_AUTO_DLE (1)        /* yml:146-151 */
 #define MYNEWT_VAL_BLE_LL_CONN_INIT_SLOTS (4)           /* yml:154-163 */
 #define MYNEWT_VAL_BLE_LL_CONN_INIT_MIN_WIN_OFFSET (0)  /* yml:165-173 */

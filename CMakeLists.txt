@@ -35,6 +35,7 @@ if(NOT CH32_SYSCLK_MHZ MATCHES "^(72|96|144)$")
 endif()
 add_compile_definitions(CH32_SYSCLK_MHZ=${CH32_SYSCLK_MHZ})
 option(CH32_BLE_TEST_IDENTITY "Use a separate static random address for GATT schema testing" OFF)
+option(CH32_BLE_PACKET_LOGS "Log NimBLE packets and GATT payloads (slows throughput tests)" OFF)
 
 # ------------------------------------------------------------- flags -------
 add_compile_options(
@@ -147,6 +148,7 @@ target_include_directories(nimble_core PUBLIC
 target_compile_definitions(nimble_core PUBLIC
     NIMBLE_CFG_CONTROLLER=1
     NIMBLE_CFG_HOST=1
+    WCH_BLE_PACKET_LOGS=$<BOOL:${CH32_BLE_PACKET_LOGS}>
 )
 target_link_libraries(nimble_core PUBLIC freertos_kernel)
 
@@ -181,6 +183,7 @@ add_executable(ch32v208_nimble
     port/syscalls.c
     app/main.c
     app/app_ble.c
+    app/app_perf.c
     app/ch32v20x_it.c
     app/system_ch32v20x.c
     ${SDK_DIR}/Startup/startup_ch32v20x_D8W.S

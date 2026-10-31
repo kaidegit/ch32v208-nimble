@@ -83,6 +83,85 @@ target not found or probe timeout; `5` connection/GATT/test failure; `130` Ctrl-
 A completed scan may have zero target matches; inspect `matched_devices` in the
 summary. Use `probe` when target absence should yield a nonzero exit status.
 
+## L2CAP and saturated performance
+
+Firmware serves unencrypted LE CoC at PSM 128 (`0x0080`), local MTU 2048,
+MPS 247 and nine initial credits. Echo tests use 512-byte stop-and-wait windows;
+`--perf` continuously fills the stream without waiting for echo. The Mac uses
+[CoreBluetooth channel streams](https://developer.apple.com/documentation/corebluetooth/cbl2capchannel)
+and handles partial reads/writes independently of SDU boundaries.
+
+```sh
+# Functional echo: 14 lengths from 1 to 4096 bytes.
+tools/macos-ble/ble.sh l2cap --phy 1m --timeout 40
+
+# Saturated one-way throughput (up = Mac -> MCU; down = MCU -> Mac).
+tools/macos-ble/ble.sh probe --perf --direction up --phy 2m --duration 30
+tools/macos-ble/ble.sh probe --perf --direction down --phy 2m --duration 30
+tools/macos-ble/ble.sh l2cap --perf --direction up --phy 2m --duration 30
+tools/macos-ble/ble.sh l2cap --perf --direction down --phy 2m --duration 30
+
+# Both transports, directions and PHYs, three repetitions each.
+python3 tools/macos-ble/perf.py --duration 30 --repeats 3
+
+# Retain the old serialized echo measurement as a latency baseline.
+tools/macos-ble/ble.sh probe --echo-perf --phy 1m
+tools/macos-ble/ble.sh l2cap --echo-perf --phy 1m
+```
+
+`--perf` defaults to upload, 30 seconds, 1M and zero deliberate inter-round pause.
+The maximum duration is one hour (32-bit receiver byte counters). Setup requests
+7.5..15 ms CI after the PHY/DLE procedure settles; the actual central-selected
+CI and controller effective DLE lengths are included in the final statistics.
+The tool requires actual DLE TX/RX = 251, rather than inferring it from MTU.
+GATT uses 244-byte frames (4-byte sequence + deterministic pattern) and the new
+`…3e06` write-without-response/notify characteristic. Upload follows
+[`canSendWriteWithoutResponse`](https://developer.apple.com/documentation/corebluetooth/cbperipheral/cansendwritewithoutresponse)
+and resumes in the readiness delegate callback. MCU download fills its outgoing
+queue with notifications, replenishing on a 1 ms callout subject to free MSYS
+blocks. CoC continuously writes 512-byte blocks under stream/credit backpressure;
+its pattern is keyed to the byte offset and survives arbitrary segmentation.
+There is no application acknowledgment per bulk packet/window.
+
+`--size` selects 4..244 bytes for GATT or 1..512 for CoC bulk writes. Setup and
+receiver statistics use the `…3e05` read/write control characteristic. Upload
+waits for MCU received bytes to equal all Mac queued bytes before stopping.
+Download waits for the Mac to verify every byte accepted by the MCU producer.
+Sequence/pattern errors, lost/extra bytes, stalls or unexpected disconnects fail.
+PHY is independently checked before and after the test.
+
+`payload_bytes_per_second` / `payload_kbps` count **one-way receiver-verified
+application payload** (including GATT's sequence field). Upload uses the MCU 1 MHz hardware cputime
+from START processing through receipt of the last byte; download uses the Mac's
+transfer start through last validated receive callback. Tail drain time is
+included. Setup/PHY/disconnect and protocol headers/control traffic are excluded.
+`queued_bytes` alone is never treated as delivered throughput. The summary also
+records producer/host backpressure, MSYS low-water mark and PHY counter deltas.
+These show the load actually applied and radio errors/retransmission indicators;
+they do not establish a chip's theoretical maximum. See the
+[measured results and limits](../../docs/l2cap-gatt-perf-2026-10-31.md).
+
+`--echo-perf` retains acknowledged GATT write/readback (default 64 bytes) or CoC
+stop-and-wait echo (default 4096-byte application rounds). Its
+`verified_echo_bytes_per_second` counts each echoed byte once;
+`aggregate_payload_kbps` counts both directions. Use it to compare round-trip
+behavior, not to report saturated one-way bandwidth.
+
+The runner saves `report.json`, raw JSONL/stderr, firmware ELF, source hashes,
+client/runner snapshots, Git revision/diff, NimBLE revision and CMake settings in
+`.build/perf-<UTC timestamp>/`. It stops on the first failure without retrying.
+It uses `caffeinate` and never accesses the probe while measuring. Build/flash
+first; the recorded local ELF is not an on-target firmware attestation.
+
+`CH32_BLE_PACKET_LOGS=OFF` disables NimBLE DEBUG/INFO packet records and per-write
+GATT payload dumps for performance runs. WARN/ERROR and application connection/
+PHY/resource records remain on UART. Set the option to `ON`, rebuild and reflash
+for packet diagnosis; return to `OFF` before comparing throughput.
+
+The new GATT schema may require the static random test identity to bypass macOS
+caching. The current test identity uses XOR `0x5c`; identifiers from the previous
+`0x5b` identity belong to the old schema. Run a name scan to find the new UUID.
+
 PHY tests require the new `…3e04` characteristic. Write a one-byte mask (`01`
 for 1M or `02` for 2M). Its six-byte status is `[version=1, HCI TX PHY, HCI RX PHY,
 pending, last update status, requested mask]`; HCI PHY values 1/2 mean 1M/2M.

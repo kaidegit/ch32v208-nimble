@@ -29,7 +29,7 @@
  * identity address is available it generates a static random address and
  * retries.
  *
- * All logs go through console_printf() (RTT backend, port/console_rtt.c).
+ * Application logs go through console_printf() (USART1 DMA backend).
  */
 
 #include <string.h>
@@ -39,10 +39,6 @@
 #include "task.h"
 
 #include "console/console.h"
-/* TODO(console): depends on the platform port providing console_printf(fmt, ...)
- * in console/console.h (port/console_rtt.c, still a stub at time of writing).
- * If the platform header ends up exposing a different entry point, swap it
- * here; BLE_HS_LOG(...)->vprintf->RTT syscalls is the fallback logging path. */
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -52,10 +48,12 @@
 #include "host/ble_gatt.h"
 #include "host/ble_store.h"
 #include "host/ble_uuid.h"
+#include "host/ble_l2cap.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
 #include "app_ble.h"
+#include "app_perf.h"
 
 /* ---------------------------------------------------- forward declarations */
 static void app_ble_advertise(void);
@@ -95,6 +93,12 @@ static const ble_uuid128_t app_chr_phy_uuid =
     BLE_UUID128_INIT(0x04, 0x3e, 0xf1, 0xa2, 0xc4, 0xd1, 0xa2, 0xb7,
                      0x8e, 0x4e, 0x4d, 0x6d, 0x0e, 0x48, 0x02, 0x7a);
 static uint16_t app_chr_phy_handle;
+static const ble_uuid128_t app_chr_perf_uuid =
+    BLE_UUID128_INIT(0x05, 0x3e, 0xf1, 0xa2, 0xc4, 0xd1, 0xa2, 0xb7,
+                     0x8e, 0x4e, 0x4d, 0x6d, 0x0e, 0x48, 0x02, 0x7a);
+static const ble_uuid128_t app_chr_bulk_uuid =
+    BLE_UUID128_INIT(0x06, 0x3e, 0xf1, 0xa2, 0xc4, 0xd1, 0xa2, 0xb7,
+                     0x8e, 0x4e, 0x4d, 0x6d, 0x0e, 0x48, 0x02, 0x7a);
 static uint8_t app_phy_pending, app_phy_status, app_phy_requested;
 
 /* GATT state: value handles are filled in by the gatts_register_cb. */
@@ -107,6 +111,102 @@ static uint8_t app_echo_buf[APP_ECHO_BUF_LEN];
 static uint16_t app_echo_len;
 
 static uint8_t app_own_addr_type;
+
+/* Raw byte echo, LE CoC PSM 0x0080. Client uses stop-and-wait writes <=512 B.
+ * SDUs may span several MPS/ACL packets; never assume a contiguous mbuf. */
+#define APP_COC_PSM 0x0080
+#define APP_COC_MTU 2048
+static uint32_t app_coc_bytes, app_coc_sdus;
+static uint8_t app_coc_stalled;
+
+static int
+app_coc_rx_ready(struct ble_l2cap_chan *chan)
+{
+    struct os_mbuf *rx = os_msys_get_pkthdr(0, 0);
+    if (!rx) {
+        return BLE_HS_ENOMEM;
+    }
+    /* This NimBLE revision attaches rx before looking up the connection;
+     * channel teardown owns it even when recv_ready returns an error. */
+    return ble_l2cap_recv_ready(chan, rx);
+}
+
+static int
+app_coc_event(struct ble_l2cap_event *event, void *arg)
+{
+    struct ble_l2cap_chan_info info;
+    struct ble_l2cap_chan *chan;
+    struct os_mbuf *sdu;
+    int rc;
+
+    switch (event->type) {
+    case BLE_L2CAP_EVENT_COC_ACCEPT:
+        if (event->accept.peer_sdu_size < 512) {
+            return BLE_HS_EINVAL;
+        }
+        return app_coc_rx_ready(event->accept.chan);
+    case BLE_L2CAP_EVENT_COC_CONNECTED:
+        app_coc_bytes = app_coc_sdus = app_coc_stalled = 0;
+        if (event->connect.status == 0 &&
+            ble_l2cap_get_chan_info(event->connect.chan, &info) == 0) {
+            app_perf_coc_connected(event->connect.chan);
+            console_printf("l2cap: connected psm=%u mtu=%u peer_mtu=%u mps=%u\n",
+                           info.psm, info.our_coc_mtu, info.peer_coc_mtu,
+                           MYNEWT_VAL(BLE_L2CAP_COC_MPS));
+        } else {
+            console_printf("l2cap: connect status=%d\n", event->connect.status);
+        }
+        return 0;
+    case BLE_L2CAP_EVENT_COC_DATA_RECEIVED:
+        if (app_perf_coc_receive(event->receive.chan, event->receive.sdu_rx)) return 0;
+        chan = event->receive.chan;
+        sdu = event->receive.sdu_rx;
+        app_coc_bytes += OS_MBUF_PKTLEN(sdu);
+        app_coc_sdus++;
+        if (app_coc_stalled) {
+            os_mbuf_free_chain(sdu);
+            rc = BLE_HS_EBUSY;
+        } else {
+            rc = ble_l2cap_send(chan, sdu);
+            /* EBUSY/EBADDATA do not consume sdu; other errors from this
+             * NimBLE revision's continue_tx already free it. */
+            if (rc == BLE_HS_EBUSY || rc == BLE_HS_EBADDATA) {
+                os_mbuf_free_chain(sdu);
+            }
+        }
+        if (rc == BLE_HS_ESTALLED) {
+            app_coc_stalled = 1;
+            return 0; /* Resume receive/credits when TX unblocks. */
+        }
+        if (rc == 0) {
+            rc = app_coc_rx_ready(chan);
+        }
+        break;
+    case BLE_L2CAP_EVENT_COC_TX_UNSTALLED:
+        app_perf_coc_unstalled(event->tx_unstalled.status);
+        if (!app_coc_stalled) return 0;
+        chan = event->tx_unstalled.chan;
+        app_coc_stalled = 0;
+        rc = event->tx_unstalled.status;
+        if (rc == 0) {
+            rc = app_coc_rx_ready(chan);
+        }
+        break;
+    case BLE_L2CAP_EVENT_COC_DISCONNECTED:
+        app_perf_coc_disconnected();
+        console_printf("l2cap: disconnected sdus=%lu bytes=%lu\n",
+                       (unsigned long)app_coc_sdus, (unsigned long)app_coc_bytes);
+        app_coc_stalled = 0;
+        return 0;
+    default:
+        return 0;
+    }
+    if (rc != 0) {
+        console_printf("l2cap: echo failed rc=%d\n", rc);
+        ble_l2cap_disconnect(chan);
+    }
+    return 0;
+}
 
 /* --------------------------------------------------------------- GATT ----- */
 
@@ -121,11 +221,15 @@ app_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                    struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     uint32_t uptime;
+#if WCH_BLE_PACKET_LOGS
     uint16_t i;
+#endif
     uint8_t phy[6] = {1, 0, 0, 0, 0, 0};
     uint16_t len;
     int rc;
 
+    if (attr_handle == app_perf_control_handle || attr_handle == app_perf_data_handle)
+        return app_perf_access(conn_handle, attr_handle, ctxt);
     switch (ctxt->op) {
     case BLE_GATT_ACCESS_OP_READ_CHR:
         if (attr_handle == app_chr_phy_handle) {
@@ -196,12 +300,14 @@ app_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
             if (rc != 0) {
                 return BLE_ATT_ERR_UNLIKELY;
             }
+#if WCH_BLE_PACKET_LOGS
             console_printf("gatt write: handle=%u len=%u data:",
                            attr_handle, app_echo_len);
             for (i = 0; i < app_echo_len; i++) {
                 console_printf(" %02x", app_echo_buf[i]);
             }
             console_printf("\n");
+#endif
             return 0;
         }
         return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
@@ -233,6 +339,16 @@ static const struct ble_gatt_svc_def app_gatt_svcs[] = { {
         .access_cb = app_gatt_access_cb,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
         .val_handle = &app_chr_phy_handle,
+    }, {
+        .uuid = &app_chr_perf_uuid.u,
+        .access_cb = app_gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+        .val_handle = &app_perf_control_handle,
+    }, {
+        .uuid = &app_chr_bulk_uuid.u,
+        .access_cb = app_gatt_access_cb,
+        .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &app_perf_data_handle,
     }, {
         0, /* no more characteristics */
     } },
@@ -338,7 +454,9 @@ app_ble_ensure_addr(void)
      * 2026-10-30: XOR constant bumped 0x5a -> 0x5b - the GAP/GATT standard
      * service registration added in 49bcbdf shifted the custom service
      * handles, and the macOS GATT cache for the previous identity address
-     * returned stale handle data (uptime chr read the device name). */
+     * returned stale handle data (uptime chr read the device name).
+     * 2026-10-31: 0x5c gives the new perf control/bulk characteristics a
+     * fresh macOS discovery identity; existing value handles stay stable. */
     rc = ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, addr.val, NULL);
     if (rc != 0) {
         rc = ble_hs_id_gen_rnd(0, &addr);
@@ -346,7 +464,7 @@ app_ble_ensure_addr(void)
             return rc;
         }
     }
-    addr.val[0] ^= 0x5b;
+    addr.val[0] ^= 0x5c;
     addr.val[5] |= 0xc0;
     rc = ble_hs_id_set_rnd(addr.val);
     if (rc == 0) {
@@ -384,6 +502,7 @@ app_ble_gap_event(struct ble_gap_event *event, void *arg)
     struct ble_gap_conn_desc desc;
     int rc;
 
+    app_perf_gap(event);
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
@@ -412,6 +531,9 @@ app_ble_gap_event(struct ble_gap_event *event, void *arg)
         console_printf("conn: disconnected handle=%d reason=0x%02x\n",
                        event->disconnect.conn.conn_handle,
                        event->disconnect.reason);
+        console_printf("conn: resources msys_free=%d freertos_free=%u min=%u\n",
+                       os_msys_num_free(), (unsigned)xPortGetFreeHeapSize(),
+                       (unsigned)xPortGetMinimumEverFreeHeapSize());
         app_ble_advertise();
         return 0;
 
@@ -519,6 +641,7 @@ app_ble_start(void)
      *    Internally calls ble_hs_init() which enqueues the host-start event
      *    on the default event queue (processed later by the host task). */
     nimble_port_init();
+    app_perf_init();
 
     /* 2. Host configuration - must happen before the start event runs. */
     ble_hs_cfg.reset_cb = app_ble_on_reset;
@@ -548,6 +671,10 @@ app_ble_start(void)
         console_printf("ble: gatts add_svcs failed rc=%d\n", rc);
         return;
     }
+
+    rc = ble_l2cap_create_server(APP_COC_PSM, APP_COC_MTU, app_coc_event, NULL);
+    configASSERT(rc == 0);
+    console_printf("l2cap: echo server psm=%u mtu=%u\n", APP_COC_PSM, APP_COC_MTU);
 
     /* 4. Spawn "ll" (highest prio) and "ble" tasks; the host task drives
      *    everything from here on. */

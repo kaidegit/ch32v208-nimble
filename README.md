@@ -7,6 +7,7 @@
 固件可烧录后独立复位运行，已完成实机互通与速率验证：
 
 - **macOS 测试客户端**：扫描、连接、服务发现、uptime 读取、echo 写入回读全部通过；1M/2M PHY 均完成显式确认与 64 字节写入回读，同一连接内 1M→2M 切换通过。
+- **L2CAP / GATT perf**：支持 CoC 字节流、GATT 无应答写入/通知的独立上下行饱和测试，接收端校验数据及最终字节数，记录实际 DLE/PHY/连接间隔和背压。串行回显另保留为 `--echo-perf`；方法与实测见 [perf 记录](docs/l2cap-gatt-perf-2026-10-31.md)。
 - **Android 手机**（nRF Connect）：连接、服务发现、1M/2M 回读、PHY 切换、重连短测通过。
 - **主频适配**：72/96/144 MHz 均通过 1M/2M 各 60 秒持续读写、手机 coded S2/S8 互通及额外 10 次重连/PHY 切换。同步修复了复测发现的临界区提前切换，详见[主频适配记录](docs/clock-rates.md)。
 - **LE Coded PHY**（2026-10-31）：复核修正同coded PHY编码不更新、TX编码位残留与RX参数倒置。手机同连接S2↔S8切换与64B回读通过，本端TX寄存器/耗时确认两种编码实际生效；对端S2发送未实测。详情见[复核记录](docs/coded-review-2026-10-31.md)。
@@ -35,7 +36,7 @@
 | `third_party/` | WCH SDK、FreeRTOS 内核、EasyLogger 等第三方源码 |
 | `ld/`、`cmake/` | 链接脚本与 WCH GCC 工具链文件 |
 | `scripts/` | 构建、烧录、串口日志、GDB 取证脚本 |
-| `tools/macos-ble/` | macOS 侧 BLE 测试客户端（扫描、GATT 读写、速率与可靠性测试） |
+| `tools/macos-ble/` | macOS 侧 BLE 测试客户端（扫描、GATT/CoC、饱和吞吐、速率与可靠性测试） |
 | `tools/android-ble/` | 通过 ADB 驱动手机 nRF Connect 的互通测试工具 |
 | `docs/` | 各阶段排查与实测记录 |
 
@@ -82,6 +83,7 @@ CPU 主频可通过 `SYSCLK_MHZ=72 scripts/build.sh` 选择 72、96 或 144 MHz�
 | [uart-easylogger-handoff.md](docs/uart-easylogger-handoff.md) | 日志迁移（EasyLogger + USART1 DMA）交接说明 |
 | [coded-phy-2026-10-31.md](docs/coded-phy-2026-10-31.md) | LE Coded S=2/S=8 接入、S=2 锚点漂移根因与手机实测 |
 | [coded-review-2026-10-31.md](docs/coded-review-2026-10-31.md) | Coded适配复核、实际编码切换修复、1537硬件错误恢复与错误码勘误 |
+| [l2cap-gatt-perf-2026-10-31.md](docs/l2cap-gatt-perf-2026-10-31.md) | GATT/CoC 上下行饱和吞吐、DLE/流控/连接间隔配置与实机结果 |
 
 ## 其他已知限制
 

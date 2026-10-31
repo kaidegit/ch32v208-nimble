@@ -155,14 +155,15 @@ SECTIONS
     } >RAM AT>FLASH
 
     /* heap for newlib _sbrk (used by NimBLE mem.c malloc path).
-     * Fixed 16K cap: msys_1 (12x292B) + LL/host mbuf traffic fit comfortably;
+     * Fixed 15K cap: leave space for the additional LE CoC channel state.
+     * MSYS/LL pools are static; newlib serves small host allocations.
      * an explicit size keeps remaining RAM visible in --print-memory-usage
      * instead of this NOLOAD region silently absorbing all slack. */
     .heap (NOLOAD) :
     {
         . = ALIGN(8);
         PROVIDE( _heap_start = . );
-        . = _heap_start + 0x4000;
+        . = _heap_start + 0x3c00;
         PROVIDE( _heap_end = . );
     } >RAM
 

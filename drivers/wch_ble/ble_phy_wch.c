@@ -88,6 +88,19 @@ struct ble_phy_stats
 };
 
 static struct ble_phy_stats g_ble_phy_stats;
+static volatile uint32_t s_perf_tx_data, s_perf_tx_md, s_perf_rx_data, s_perf_rx_md;
+
+/* Non-halting diagnostics for throughput runs. Values are cumulative; the
+ * application snapshots before/after a run and reports the delta. */
+void ble_phy_wch_perf_snapshot(uint32_t out[12])
+{
+    out[0]=g_ble_phy_stats.tx_good; out[1]=g_ble_phy_stats.tx_fail;
+    out[2]=g_ble_phy_stats.tx_late; out[3]=g_ble_phy_stats.rx_valid;
+    out[4]=g_ble_phy_stats.rx_crc_err; out[5]=g_ble_phy_stats.rx_timeouts;
+    out[6]=g_ble_phy_stats.no_bufs; out[7]=g_ble_phy_stats.hw_errs;
+    out[8]=s_perf_tx_data;out[9]=s_perf_tx_md;
+    out[10]=s_perf_rx_data;out[11]=s_perf_rx_md;
+}
 
 /* Small PHY control PDU trace for distinguishing a peer's no-change reply
  * from a local mode-programming failure. Only CRC-valid RX is recorded. */
@@ -454,6 +467,10 @@ phy_rx_done_isr(uint32_t ts)
 
     /* Vendor ble_ll_chkcrc reads BB+0x38 bit5 after actual RX completion. */
     if (wch_rf_rx_crc_ok()) {
+        if (ble_ll_state_get() == BLE_LL_STATE_CONNECTION) {
+            if (rxbuf[1] && (rxbuf[0] & 3U) != 3U) ++s_perf_rx_data;
+            if (rxbuf[0] & 0x10U) ++s_perf_rx_md;
+        }
         ble_hdr->rxinfo.flags |= BLE_MBUF_HDR_F_CRC_OK;
         ++g_ble_phy_stats.rx_valid;
         phy_trace_control(0, rxbuf);
@@ -724,6 +741,10 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
     }
 
     ++g_ble_phy_stats.tx_started;
+    if (ble_ll_state_get() == BLE_LL_STATE_CONNECTION) {
+        if (pyld_len && (hdr_byte & 3U) != 3U) ++s_perf_tx_data;
+        if (hdr_byte & 0x10U) ++s_perf_tx_md;
+    }
     g_ble_phy_stats.tx_bytes += (uint32_t)pyld_len + BLE_LL_PDU_HDR_LEN;
     return BLE_ERR_SUCCESS;
 }
