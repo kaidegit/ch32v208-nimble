@@ -108,7 +108,9 @@ a different identifier to that identity. The option defaults to OFF; use
 `-DCH32_BLE_TEST_IDENTITY=OFF` to restore public-address advertising. Its purpose
 is fresh service discovery during schema changes, not PHY selection. This
 workaround is not evidence that the public-address firmware lacks the new service.
-Coded PHY is disabled and is not accepted by `--phy`.
+Firmware supports Coded PHY, but this Mac client accepts only1M/2M in `--phy`;
+use the [ADB phone tool](../android-ble/README.md) for coded requests and see
+the [coded review](../../docs/coded-review-2026-10-31.md) for actual coding checks.
 
 ## Reliability runs
 

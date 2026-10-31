@@ -8,8 +8,9 @@
 
 - **macOS 测试客户端**：扫描、连接、服务发现、uptime 读取、echo 写入回读全部通过；1M/2M PHY 均完成显式确认与 64 字节写入回读，同一连接内 1M→2M 切换通过。
 - **Android 手机**（nRF Connect）：连接、服务发现、1M/2M 回读、PHY 切换、重连短测通过。
+- **LE Coded PHY**（2026-10-31）：复核修正同coded PHY编码不更新、TX编码位残留与RX参数倒置。手机同连接S2↔S8切换与64B回读通过，本端TX寄存器/耗时确认两种编码实际生效；对端S2发送未实测。详情见[复核记录](docs/coded-review-2026-10-31.md)。
 - **长时可靠性**：早期镜像通过 30 次复位、100 次重连、1M/2M 各 30 分钟持续连接读写，累计 1 万余轮回读校验，覆盖 cputime 自然回卷。
-- **尚未完成**：当前镜像（收发时序调整 + 串口日志版）未重做长时测试；coded PHY 与仪器级射频指标未验证。暂不宣称 BLE 已完全稳定。
+- **尚未完成**：当前镜像未重做长时测试；coded大流量、部分接收事件预算及此前队列自环仍需验证；仪器级射频指标未验证。暂不宣称BLE已完全稳定。
 
 各阶段实测数据与排查过程见 [docs/](docs/) 索引。
 
@@ -74,12 +75,14 @@ scripts/log.sh -p /dev/cu.usbmodemXXX
 | [android-interop-2026-10-30.md](docs/android-interop-2026-10-30.md) | Android 手机互通排查与 RTT 结论 |
 | [uart-review-2026-10-30.md](docs/uart-review-2026-10-30.md) | 串口 DMA 日志复核与手机短测 |
 | [uart-easylogger-handoff.md](docs/uart-easylogger-handoff.md) | 日志迁移（EasyLogger + USART1 DMA）交接说明 |
+| [coded-phy-2026-10-31.md](docs/coded-phy-2026-10-31.md) | LE Coded S=2/S=8 接入、S=2 锚点漂移根因与手机实测 |
+| [coded-review-2026-10-31.md](docs/coded-review-2026-10-31.md) | Coded适配复核、实际编码切换修复、1537硬件错误恢复与错误码勘误 |
 
 ## 其他已知限制
 
 - SM/配对未启用：GATT 特征全部无加密要求，地址默认 public。
 - RNG 为硬件 LFSR 类随机源，可用于地址生成等一般用途，不可作为配对/加密密钥熵源。
-- privacy / coded PHY 关闭；legacy 广播 1M，连接支持 1M/2M，默认偏好 1M。
+- privacy 关闭；legacy 广播 1M，连接支持 1M/2M/coded(S=2/S=8)，默认偏好 1M，coded 由测试特征值显式请求。
 
 ## 第三方组件与许可
 

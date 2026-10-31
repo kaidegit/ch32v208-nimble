@@ -28,10 +28,16 @@ struct wch_rf_timing g_wch_rf_timing = {
     .tx_guard_us = 100,                 /* busy-wait margin - TODO(board): RE §12.10 */
     .tx_late_guard_us = 50,             /* TODO(board): RE §12.10 */
     .wfr_half_us_1m = 0x196,            /* 203 us - RE §4.8/§12.1 ACK/等待窗 */
+    .wfr_half_us_coded = 0x43E,         /* 543 us: IFS 150 + coded sync 376 + 17 */
     .tifs_turnaround_half_us = 0xB4,    /* 90 us nominal - TODO(board): RE §5.3 table is 93..107 */
     .ack_window_half_us_1m = 0x196,     /* RE §4.8 rf_tx_auto_txProcess */
     .ack_window_half_us_2m = 0x196,     /* RE §12.1: 1M/2M both 0x196 */
+    /* Vendor tests (BB[0] >> 12) & 3: both coded TX values (0x2000/0x6000)
+     * select 2, hence both use 0x43E = 543us total. Subtract the IFS added
+     * by the PHY to obtain the sync allowance below. */
+    .ack_window_half_us_coded = 786,    /* 393 us = vendor C_PHY 0x189 */
     .rx_window_widen_half_us = 73,      /* C_PHY @1M - RE §12.1 */
+    .rx_window_widen_half_us_coded = 786,   /* C_PHY coded 0x189 = 393 us */
     .tune_timeout_us = 10000,           /* VCO tune / filter measure budget */
     .lo_inject_khz_1m = 1000,           /* low-side LO injection - RE §4.2 (*) */
     .lo_inject_khz_2m = 2000,           /* RE §4.2 (*) */
@@ -46,7 +52,7 @@ static uint32_t s_aa;                   /* access address                     */
 static uint32_t s_crcinit;              /* CRC init (24-bit)                  */
 static uint32_t s_synth_khz;            /* last programmed synth frequency    */
 
-static uint8_t  s_phy_tx = 1;           /* 1 = 1M, 2 = 2M (coded: v1 no)      */
+static uint8_t  s_phy_tx = 1;           /* NimBLE phy modes 0..3; 1 = 1M       */
 static uint8_t  s_phy_rx = 1;
 static bool     s_whiten_off;           /* NimBLE always whitens -> false     */
 static bool     s_encrypt;              /* CCM enabled -> LLE[0x50] bit5      */
@@ -54,14 +60,31 @@ static bool     s_dtm;                  /* demod cfg14 variant - RE §4.4      *
 static bool     s_auto_arm_rx;          /* TX->RX T_IFS continuation flag     */
 static bool     s_rx_crc_ok;
 static bool s_rx_progress;
-volatile uint32_t g_wch_rf_tx_elapsed_us[16];
-volatile uint8_t g_wch_rf_tx_payload_len[16];
+/* Indexed by NimBLE TX mode, not LLID: preserve actual TX timing and RFCTRL
+ * across S=2 -> S=8 transitions for post-test verification without a probe
+ * attached during radio operation. */
+volatile uint32_t g_wch_rf_tx_elapsed_us[4];
+volatile uint8_t g_wch_rf_tx_payload_len[4];
+volatile uint32_t g_wch_rf_tx_rfctrl[4];
 static bool     s_rx_armed;             /* engine waiting for a frame         */
 
 static uint8_t s_rx_dma[WCH_RF_RX_BUFFER_SIZE] __attribute__((aligned(4)));
 static uint8_t *s_rxbuf = s_rx_dma; /* direct hardware RX destination */
 static uint8_t  s_last_rx_len;          /* len byte of last RX (RE §5.3)      */
 static uint32_t s_last_anchor;          /* cputime @ clock-capture event      */
+
+/* Per-RX clock-capture diagnostics (GDB-readable; coded-PHY bring-up).
+ * delta_us = cputime at RX_DONE minus the BB bit6 capture time; cap=1 when
+ * the capture fired between RX arm and frame completion.  For a capture at
+ * access-address end the 1M expectation is delta ~= 8*(len+5) us. */
+volatile struct wch_rf_rx_diag {
+    uint8_t len;
+    uint8_t cap;
+    uint16_t pad;
+    uint32_t delta_us;
+} g_wch_rf_rxdiag[8];
+volatile uint32_t g_wch_rf_rxdiag_idx;
+volatile uint32_t g_wch_rf_clkcap_events;
 
 static uint8_t  s_rspbuf[2 + 255];      /* auto-ack response frame            */
 
@@ -148,6 +171,8 @@ freq_for_channel(uint8_t ch)
 static uint16_t
 lo_inject_for_phy(uint8_t phy)
 {
+    /* Channel-number mode never programs the synthesizer directly; the
+     * injection value only feeds bookkeeping.  Coded uses the 1M offset. */
     return (phy == 2) ? g_wch_rf_timing.lo_inject_khz_2m
                       : g_wch_rf_timing.lo_inject_khz_1m;
 }
@@ -189,20 +214,51 @@ wch_rf_whiten_set(bool disable)
     s_whiten_off = disable;
 }
 
+/* BB[0x00] bits[13:12] (+bit14) per NimBLE phy mode.
+ * TX: vendor BLE_SetPHYTxMode 0x135ba - 1M(phy0)=0x1000, 2M(phy1)=0,
+ * S=8(phy2)=0x2000, S=2(phy3)=0x2000|0x4000.
+ * RX: vendor BLE_SetPHYRxMode 0x13752 - coded uses 0x2000 for both codings;
+ * the demodulator follows the CI field of each packet. */
+static uint32_t
+bb_phy_bits_tx(uint8_t mode)
+{
+    switch (mode) {
+    case 2:                                 /* BLE_PHY_MODE_2M */
+        return WCH_BB_RFCTRL_PHY_2M;
+    case 3:                                 /* BLE_PHY_MODE_CODED_125KBPS (S=8) */
+        return WCH_BB_RFCTRL_PHY_CODED;
+    case 0:                                 /* BLE_PHY_MODE_CODED_500KBPS (S=2) */
+        return WCH_BB_RFCTRL_PHY_CODED | WCH_BB_RFCTRL_PHY_S2;
+    default:                                /* BLE_PHY_MODE_1M */
+        return WCH_BB_RFCTRL_PHY_1M;
+    }
+}
+
+static uint32_t
+bb_phy_bits_rx(uint8_t mode)
+{
+    if (mode == 2) {
+        return WCH_BB_RFCTRL_PHY_2M;
+    }
+    if (mode == 0 || mode == 3) {
+        return WCH_BB_RFCTRL_PHY_CODED;
+    }
+    return WCH_BB_RFCTRL_PHY_1M;
+}
+
+static bool
+phy_is_coded(uint8_t mode)
+{
+    return mode == 0 || mode == 3;
+}
+
 void
 wch_rf_phy_mode_set(uint8_t tx_mode, uint8_t rx_mode)
 {
-    /* Coded PHY not supported in v1 - clamp to 1M (see report limitations). */
-    if (tx_mode == 2) {
-        s_phy_tx = 2;
-    } else {
-        s_phy_tx = 1;
-    }
-    if (rx_mode == 2) {
-        s_phy_rx = 2;
-    } else {
-        s_phy_rx = 1;
-    }
+    /* NimBLE controller modes (ble_phy.h): 0=coded S=2, 1=1M, 2=2M,
+     * 3=coded S=8.  Anything else clamps to 1M. */
+    s_phy_tx = (tx_mode <= 3) ? tx_mode : 1;
+    s_phy_rx = (rx_mode <= 3) ? rx_mode : 1;
 }
 
 uint8_t
@@ -261,6 +317,12 @@ wch_rf_last_anchor(void)
     return s_last_anchor;
 }
 
+bool
+wch_rf_rx_captured(void)
+{
+    return s_rx_progress;
+}
+
 void
 wch_rf_auto_arm_rx(bool en)
 {
@@ -292,33 +354,77 @@ notify(enum wch_rf_event evt, uint32_t payload)
 /* ------------------------------------------------------------------------- */
 
 static void
-set_phy_tx_mode(uint8_t phy, uint8_t payload_len)
+set_phy_tx_mode(uint8_t mode, uint8_t payload_len)
 {
-    /* Vendor BLE_SetPHYTxMode 0x136dc..13712 (1M), 0x135fc..13638 (2M). */
-    WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
-                    (phy == 2 ? WCH_BB_RFCTRL_PHY_2M : WCH_BB_RFCTRL_PHY_1M);
+    /*
+     * Vendor BLE_SetPHYTxMode 0x135ba, all four branches share the guard
+     * protocol (LLE[0x0C] bit13 save/clear + fence, LLE[0x08]=0x2000 pre-arm
+     * clear, restore) and only the PHY bits and TX window differ.  Window is
+     * the LLE[0x64] TX busy bound in half-us; vendor formulas with the
+     * gBleIPPara+0xA window parameter at its reset value 0:
+     *   1M: (len+10)*8 + 158 us    2M: (len+11)*4 + 158 us
+     *   S8: (len+2)*64 + 782 us    S2: (len+2)*16 + 620 us
+     * (each coded branch is coded airtime + ~190 us margin).
+     */
+    /* 0x13668..0x136b2 clears bits15:14 on EACH coded TX. Without this,
+     * S=8 after S=2 retains bit14 and still transmits S=2. */
+    uint32_t mask = WCH_BB_RFCTRL_PHY_MASK |
+                    (phy_is_coded(mode) ? WCH_BB_RFCTRL_CODING_MASK : 0U);
+    WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~mask) |
+                    bb_phy_bits_tx(mode);
     uint32_t saved = WCH_RF_GUARD_REG;
     WCH_RF_GUARD_REG = saved & ~0x2000UL;
     __asm volatile("nop; nop" ::: "memory");
     WCH_LLE_IRQSTAT = 0x2000;
-    WCH_LLE_WINDOW = phy == 2 ? 8UL * (payload_len + 11UL) + 316UL
-                              : 16UL * (payload_len + 10UL) + 316UL;
+    uint32_t window;
+    switch (mode) {
+    case 2:                                 /* 2M */
+        window = 8UL * (payload_len + 11UL) + 316UL;
+        break;
+    case 3:                                 /* coded S=8 */
+        window = 128UL * (payload_len + 2UL) + 1564UL;
+        break;
+    case 0:                                 /* coded S=2 */
+        window = 32UL * (payload_len + 2UL) + 1240UL;
+        break;
+    default:                                /* 1M */
+        window = 16UL * (payload_len + 10UL) + 316UL;
+        break;
+    }
+    WCH_LLE_WINDOW = window;
     WCH_RF_GUARD_REG = saved;
 }
 
 static void
-set_phy_rx_mode(uint8_t phy)
+set_phy_rx_mode(uint8_t mode)
 {
-    /* Vendor enum0=1M/enum1=2M share this group (0x137c2..1382c).
-     * The (enum & 2) branch at0x13748 is coded PHY, unsupported here. */
-    WCH_REG32(WCH_BB_BASE, 0x20) = 0x00090083UL;
-    WCH_REG32(WCH_BB_BASE, 0x14) = 0x08101901UL;
-    WCH_REG32(WCH_BB_BASE, 0x18) = 0x00031624UL;
-    WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
-                    (phy == 2 ? WCH_BB_RFCTRL_PHY_2M : WCH_BB_RFCTRL_PHY_1M);
-    WCH_REG32(WCH_BB_BASE, 0x28) = 0x28be;
-    WCH_REG32(WCH_BB_BASE, 0x24) = 0x01006310;
-    WCH_REG32(WCH_BB_BASE, 0x10) = s_dtm ? 0x003fa2ceUL : 0x003222d0UL;
+    /*
+     * Vendor BLE_SetPHYRxMode 0x13714.  1M (enum0) and 2M (enum1) share one
+     * demod group (0x137c2..0x1382c) and differ only in BB[0x00] PHY bits /
+     * window; coded (enum2/enum3, 0x13752..0x137c0) has a second group which
+     * is written identically for S=2 and S=8 (CI-adaptive demod).
+     */
+    if (phy_is_coded(mode)) {
+        WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
+                        bb_phy_bits_rx(mode);
+        WCH_REG32(WCH_BB_BASE, 0x20) = WCH_BB_RXCFG20_CODED;
+        WCH_REG32(WCH_BB_BASE, 0x14) = WCH_BB_RXCFG14_CODED;
+        WCH_REG32(WCH_BB_BASE, 0x18) = WCH_BB_RXCFG18_CODED;
+        WCH_REG32(WCH_BB_BASE, 0x28) = WCH_BB_RXCFG28_CODED;
+        WCH_REG32(WCH_BB_BASE, 0x24) = WCH_BB_RXCFG24_CODED;
+        WCH_REG32(WCH_BB_BASE, 0x10) = s_dtm ? WCH_BB_RXCFG10_CODED_DTM
+                                             : WCH_BB_RXCFG10_CODED;
+    } else {
+        WCH_REG32(WCH_BB_BASE, 0x20) = 0x00090083UL;
+        WCH_REG32(WCH_BB_BASE, 0x14) = 0x08101901UL;
+        WCH_REG32(WCH_BB_BASE, 0x18) = 0x00031624UL;
+        WCH_BB_RFCTRL = (WCH_BB_RFCTRL & ~WCH_BB_RFCTRL_PHY_MASK) |
+                        (mode == 2 ? WCH_BB_RFCTRL_PHY_2M
+                                   : WCH_BB_RFCTRL_PHY_1M);
+        WCH_REG32(WCH_BB_BASE, 0x28) = 0x28be;
+        WCH_REG32(WCH_BB_BASE, 0x24) = 0x01006310;
+        WCH_REG32(WCH_BB_BASE, 0x10) = s_dtm ? 0x003fa2ceUL : 0x003222d0UL;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -546,8 +652,9 @@ wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us)
         }
     }
 
-    g_wch_rf_tx_elapsed_us[frame[0] & 15U] = os_cputime_get32() - started;
-    g_wch_rf_tx_payload_len[frame[0] & 15U] = frame[1];
+    g_wch_rf_tx_elapsed_us[s_phy_tx] = os_cputime_get32() - started;
+    g_wch_rf_tx_payload_len[s_phy_tx] = frame[1];
+    g_wch_rf_tx_rfctrl[s_phy_tx] = WCH_BB_RFCTRL;
     wch_rf_guard_exit();
     return rc;
 }
@@ -689,7 +796,13 @@ wch_rf_lle_isr(void)
         s_rx_crc_ok = (WCH_BB_IRQSTAT & 0x20UL) == 0;
         WCH_LLE_IRQSTAT = WCH_LLE_IRQ_RX_DONE;
         if (was_rx && s_rxbuf != NULL) {
+            volatile struct wch_rf_rx_diag *d;
             s_last_rx_len = s_rxbuf[1];
+            d = &g_wch_rf_rxdiag[g_wch_rf_rxdiag_idx++ & 7U];
+            d->len = s_rxbuf[1];
+            d->cap = s_rx_progress ? 1U : 0U;
+            d->delta_us = s_rx_progress ?
+                          os_cputime_get32() - s_last_anchor : 0;
             s_rx_armed = false;
             notify(WCH_RF_EVT_RX_DONE, os_cputime_get32());
         }
@@ -718,13 +831,25 @@ wch_rf_bb_isr(void)
      * bit5) and the deferred RX-window reload are not used by this port. */
     if (st & WCH_BB_IRQSTAT_CLKCAP) {
         s_last_anchor = os_cputime_get32();
+        g_wch_rf_clkcap_events++;
         WCH_BB_IRQSTAT = WCH_BB_IRQSTAT_CLKCAP_CLR;
         if (s_rx_armed && !s_rx_progress) {
             s_rx_progress = true;
             /* Address match closes WFR, then allow the entire PDU. */
             /* BLE_SetPHYRxMode 0x13808..0x1382c: (max+5)*
-             * (1M:16, 2M:8)+60 half-us after address capture. */
-            WCH_LLE_WINDOW = (s_phy_rx == 2 ? 8U : 16U) * (255U + 5U) + 60U;
+             * (1M:16, 2M:8)+60 half-us after address capture. Coded: vendor
+             * receive-window formula (win<<7 + 868, win = octets+4) = 64 us
+             * per octet at S=8 worst case; S=2 payloads are faster and the
+             * demod is CI-adaptive, so one budget covers both. */
+            uint32_t reload;
+            if (s_phy_rx == 2) {
+                reload = 8U * (255U + 5U) + 60U;
+            } else if (phy_is_coded(s_phy_rx)) {
+                reload = (255U + 4U) * 128U + 868U;
+            } else {
+                reload = 16U * (255U + 5U) + 60U;
+            }
+            WCH_LLE_WINDOW = reload;
             notify(WCH_RF_EVT_RX_START, s_last_anchor);
         }
     }

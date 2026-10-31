@@ -88,8 +88,9 @@ static const ble_uuid128_t app_chr_echo_uuid =
     BLE_UUID128_INIT(0x03, 0x3e, 0xf1, 0xa2, 0xc4, 0xd1, 0xa2, 0xb7,
                      0x8e, 0x4e, 0x4d, 0x6d, 0x0e, 0x48, 0x02, 0x7a);
 
-/* PHY test control/status: write mask 1 (1M) or 2 (2M); read version,
- * HCI TX/RX PHY, pending, last update status, requested mask (six bytes). */
+/* PHY test control/status: write 1 (1M), 2 (2M), 3 (coded S=2 / 500kbps) or
+ * 4 (coded S=8 / 125kbps); read version, HCI TX/RX PHY (3 = coded), pending,
+ * last update status, requested selector (six bytes). */
 static const ble_uuid128_t app_chr_phy_uuid =
     BLE_UUID128_INIT(0x04, 0x3e, 0xf1, 0xa2, 0xc4, 0xd1, 0xa2, 0xb7,
                      0x8e, 0x4e, 0x4d, 0x6d, 0x0e, 0x48, 0x02, 0x7a);
@@ -151,16 +152,36 @@ app_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
     case BLE_GATT_ACCESS_OP_WRITE_CHR:
         if (attr_handle == app_chr_phy_handle) {
+            uint8_t mask;
+            uint16_t opts;
             rc = ble_hs_mbuf_to_flat(ctxt->om, phy, 1, &len);
-            if (rc != 0 || len != 1 || (phy[0] != 1 && phy[0] != 2)) {
+            if (rc != 0 || len != 1 || phy[0] < 1 || phy[0] > 4) {
                 return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
             }
             if (app_phy_pending) {
                 return BLE_ATT_ERR_UNLIKELY;
             }
-            rc = ble_gap_set_prefered_le_phy(conn_handle, phy[0], phy[0], 0);
-            console_printf("phy: request handle=%u mask=%u rc=%d\n",
-                           conn_handle, phy[0], rc);
+            switch (phy[0]) {
+            case 2:
+                mask = BLE_GAP_LE_PHY_2M_MASK;
+                opts = BLE_GAP_LE_PHY_CODED_ANY;
+                break;
+            case 3:
+                mask = BLE_GAP_LE_PHY_CODED_MASK;
+                opts = BLE_GAP_LE_PHY_CODED_S2;
+                break;
+            case 4:
+                mask = BLE_GAP_LE_PHY_CODED_MASK;
+                opts = BLE_GAP_LE_PHY_CODED_S8;
+                break;
+            default:
+                mask = BLE_GAP_LE_PHY_1M_MASK;
+                opts = BLE_GAP_LE_PHY_CODED_ANY;
+                break;
+            }
+            rc = ble_gap_set_prefered_le_phy(conn_handle, mask, mask, opts);
+            console_printf("phy: request handle=%u sel=%u mask=%u opts=%u rc=%d\n",
+                           conn_handle, phy[0], mask, opts, rc);
             if (rc != 0) {
                 return BLE_ATT_ERR_UNLIKELY;
             }
@@ -313,7 +334,11 @@ app_ble_ensure_addr(void)
 
 #if APP_BLE_TEST_IDENTITY
     /* Separate, deterministic identity for cache-sensitive GATT development.
-     * No option bytes, Flash MAC or persistent storage are changed. */
+     * No option bytes, Flash MAC or persistent storage are changed.
+     * 2026-10-30: XOR constant bumped 0x5a -> 0x5b - the GAP/GATT standard
+     * service registration added in 49bcbdf shifted the custom service
+     * handles, and the macOS GATT cache for the previous identity address
+     * returned stale handle data (uptime chr read the device name). */
     rc = ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, addr.val, NULL);
     if (rc != 0) {
         rc = ble_hs_id_gen_rnd(0, &addr);
@@ -321,7 +346,7 @@ app_ble_ensure_addr(void)
             return rc;
         }
     }
-    addr.val[0] ^= 0x5a;
+    addr.val[0] ^= 0x5b;
     addr.val[5] |= 0xc0;
     rc = ble_hs_id_set_rnd(addr.val);
     if (rc == 0) {

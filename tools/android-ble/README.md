@@ -66,8 +66,12 @@ identifiers, so raw files stay ignored.
 Connection success requires `CONNECTED` and the test service UUID in the UI.
 GATT operations require the exact selected target address, and only expose
 the three test characteristics: uptime (read), echo (read/write, up to64 bytes),
-and PHY (write01/02, read negotiated status). Echo writes must match readback;
-PHY writes must finish with both actual directions matching the request.
+and PHY (write 01=1M, 02=2M, 03=coded S=2, 04=coded S=8; read negotiated
+status). Echo writes must match readback;
+PHY writes must finish with both HCI PHY directions matching and the requested
+selector echoed back. HCI value3 means LE Coded; it does not distinguish S=2
+from S=8. Validate actual TX coding with RFCTRL and TX airtime or a sniffer;
+the peer chooses its own coding independently.
 Failed actions are not retried automatically; the saved UI helps diagnosis.
 The dump helper may repeat only the UI read briefly during a window transition;
 it never repeats the payload input because of a missing XML file.

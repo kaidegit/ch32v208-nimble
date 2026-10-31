@@ -88,6 +88,17 @@ def value_bytes(root, uuid):
     raise RuntimeError('Hex characteristic value not present after read')
 
 
+def phy_status_matches(data, selector):
+    """HCI confirms coded only; selector verifies this request was accepted.
+
+    Actual S=2/S=8 transmission still needs RFCTRL/airtime or sniffer evidence.
+    """
+    expected = {1: 1, 2: 2, 3: 3, 4: 3}.get(selector)
+    return expected is not None and len(data) == 6 and data[0] == 1 and \
+        data[1] == expected and data[2] == expected and \
+        data[3:5] == b'\0\0' and data[5] == selector
+
+
 def hci_summary(dump, name, address, since_timestamp=None):
     """Decode Android's in-memory btsnooz ring; no logging settings change.
 
@@ -400,7 +411,10 @@ class Phone:
             report['phy_status'] = list(data)
             report['success'] = len(data) == 6 and data[0] == 1
             if payload is not None:
-                report['success'] = report['success'] and data[1:3] == payload * 2 and data[3:5] == b'\0\0'
+                # Firmware PHY selectors: 1=1M, 2=2M, 3=coded S=2, 4=coded
+                # S=8. The readback reports the HCI PHY, and both coded
+                # selectors read back as 3 (HCI has no S=2/S=8 distinction).
+                report['success'] = phy_status_matches(data, payload[0])
         self.screenshot('gatt-result')
         emit('gatt_result', uuid=uuid, read_hex=data.hex(), success=report['success'])
         return 0 if report['success'] else 6
@@ -431,8 +445,9 @@ def main():
             [SERVICE[:-2] + suffix for suffix in ('02', '03', '04')]):
         p.error('gatt requires --address and a test service characteristic UUID')
     if payload is not None and (args.command != 'gatt' or len(payload) > 64 or
-            args.uuid.endswith('02') or args.uuid.endswith('04') and payload not in (b'\x01', b'\x02')):
-        p.error('write supports echo (<=64 bytes) or PHY (01/02) only')
+            args.uuid.endswith('02') or args.uuid.endswith('04') and payload not in
+            (b'\x01', b'\x02', b'\x03', b'\x04')):
+        p.error('write supports echo (<=64 bytes) or PHY selector (01..04) only')
     if not 3 <= args.duration <= 30:
         p.error('--duration must be 3..30 seconds (preserves the app scan timeout setting)')
     adb = adb_path(args.adb)

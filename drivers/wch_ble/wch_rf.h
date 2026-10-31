@@ -49,10 +49,16 @@ extern "C" {
  *   bit6    whitening disabled
  *   bit7    "shut" state
  *   bit8    direction (both TX and RX sequences set (b&~0x180)|0x100)
- *   [13:12] PHY mode (01=1M, 00=2M; vendor enum0/1)
+ *   [13:12] PHY mode: 01=1M, 00=2M, 10=coded; coded bit14 set = S=2 coding
+ *           (vendor BLE_SetPHYTxMode 0x135ba: phy2 -> 0x2000, phy3 -> 0x6000;
+ *           phy2 window matches S=8 airtime +190us, phy3 matches S=2 +190us)
  *   bit23   TX trigger (RF_Tx final step: BB[0x00]|=0x800000, RE §4.6)
  *   bit29   CTE enable (not used here)
  *   bit28   set by BB_DevInit (0x10000000)
+ *
+ * RX never sets bit14: the demodulator learns the coding scheme from the
+ * CI field of each received packet (BLE_SetPHYRxMode 0x13752 writes 0x2000
+ * for both coded vendor enums).
  */
 #define WCH_BB_RFCTRL           (WCH_REG32(WCH_BB_BASE, 0x00))
 #define WCH_BB_RFCTRL_CH_MASK       0x0000003FUL
@@ -64,6 +70,9 @@ extern "C" {
 #define WCH_BB_RFCTRL_PHY_MASK      0x00003000UL
 #define WCH_BB_RFCTRL_PHY_1M        0x00001000UL
 #define WCH_BB_RFCTRL_PHY_2M        0x00000000UL    /* RE §4.4 */
+#define WCH_BB_RFCTRL_PHY_CODED     0x00002000UL    /* bits[13:12]=10, RE §4.4 */
+#define WCH_BB_RFCTRL_PHY_S2        0x00004000UL    /* bit14: S=2 TX coding    */
+#define WCH_BB_RFCTRL_CODING_MASK   0x0000C000UL    /* vendor clears bits15:14 before coded TX */
 #define WCH_BB_RFCTRL_TX_TRIG       0x00800000UL    /* bit23 - RE §4.6 */
 
 /* BB +0x04 = CRC init value; BB +0x08 = access address (RE §4.6/§4.7/§12.6) */
@@ -72,13 +81,25 @@ extern "C" {
 
 /* RX group byte offsets verified in BLE_SetPHYRxMode 0x137c2..1382c.
  * 1M: +10=0x3222D0 (+10=0x3FA2CE in DTM), +14=0x08101901,
- * +18=0x31624, +20=0x90083, +24=0x01006310, +28=0x28BE. */
+ * +18=0x31624, +20=0x90083, +24=0x01006310, +28=0x28BE.
+ * Coded (vendor enum 2/3, 0x13752..0x137c0; one group for S=2 AND S=8):
+ * +10=0x34A4DF (+10=0x3FA4DF in DTM), +14=0x08301FF1, +18=0x31619,
+ * +20=0x90086, +24=0x01006310, +28=0x28DE. */
 #define WCH_BB_RXCFG10          (WCH_REG32(WCH_BB_BASE, 0x10))
 #define WCH_BB_RXCFG14          (WCH_REG32(WCH_BB_BASE, 0x14))
 #define WCH_BB_RXCFG18          (WCH_REG32(WCH_BB_BASE, 0x18))
 #define WCH_BB_RXCFG20          (WCH_REG32(WCH_BB_BASE, 0x20))
 #define WCH_BB_RXCFG24          (WCH_REG32(WCH_BB_BASE, 0x24))
 #define WCH_BB_RXCFG28          (WCH_REG32(WCH_BB_BASE, 0x28))
+
+/* Coded RX demod group (BLE_SetPHYRxMode 0x13760..0x1379c write order) */
+#define WCH_BB_RXCFG10_CODED        0x034A4DFUL
+#define WCH_BB_RXCFG10_CODED_DTM    0x03FA4DFUL
+#define WCH_BB_RXCFG14_CODED        0x08301FF1UL
+#define WCH_BB_RXCFG18_CODED        0x00031619UL
+#define WCH_BB_RXCFG20_CODED        0x00090086UL
+#define WCH_BB_RXCFG24_CODED        0x01006310UL
+#define WCH_BB_RXCFG28_CODED        0x000028DEUL
 
 /*
  * BB +0x2C:
@@ -190,7 +211,8 @@ extern "C" {
  *   read != 0 = engine busy (ll_tx/rx_wait_finish spin)
  *   write     = "next action" scheduling value in 0.5 us units:
  *             0 = clear, 0xA0 = TX (basic), RX window width, ACK window
- *             (1M 0x196 = 203us, coded S8 0x43E = 543us, S2 0x1BE = 223us).
+ *             (vendor: 2M 0x196 = 203us, both coded modes 0x43E = 543us,
+ *              1M 0x1BE = 223us; this basic-mode port adds its own IFS).
  */
 #define WCH_LLE_WINDOW          (WCH_REG32(WCH_LLE_BASE, 0x64))
 #define WCH_LLE_WINDOW_TX           0xA0UL      /* RE §4.6/§12.6 */
@@ -353,10 +375,14 @@ struct wch_rf_timing {
     uint16_t tx_guard_us;           /* busy-wait margin before sched start   */
     uint16_t tx_late_guard_us;      /* "late" threshold after sched start    */
     uint32_t wfr_half_us_1m;        /* default RX window if LL gives none    */
+    uint32_t wfr_half_us_coded;     /* ditto, coded PHY (sync=376us+margin)  */
     uint32_t tifs_turnaround_half_us; /* TX->RX turnaround (LLE[0x1C] base)  */
     uint32_t ack_window_half_us_1m; /* post-TX RX window, RE §4.8: 0x196     */
-    uint32_t ack_window_half_us_2m; /* post-TX RX window, RE §4.8: 0x1BE?    */
+    uint32_t ack_window_half_us_2m; /* post-TX RX window, RE §12.1: 0x196    */
+    uint32_t ack_window_half_us_coded; /* post-TX RX sync allowance: IFS +   */
+                                       /* this == vendor 0x43E total (543us) */
     uint32_t rx_window_widen_half_us; /* C_PHY allowance (1M 73, RE §12.1)   */
+    uint32_t rx_window_widen_half_us_coded; /* C_PHY coded = 0x189 (RE §12.1)*/
     uint32_t tune_timeout_us;       /* VCO tune / filter measure poll budget */
     uint16_t lo_inject_khz_1m;      /* low-side LO injection 1M: 1000 kHz    */
     uint16_t lo_inject_khz_2m;      /* low-side LO injection 2M: 2000 kHz    */
@@ -451,11 +477,19 @@ void wch_rf_bb_isr(void);
 /* Anchor timestamp (os_cputime @1MHz) captured on BB clock-capture event */
 uint32_t wch_rf_last_anchor(void);
 
+/* True while the BB clock capture fired for the frame in progress
+ * (wch_rf_last_anchor() then holds the capture cputime). */
+bool wch_rf_rx_captured(void);
+
 /* Auto RX-arm after TX (T_IFS continuation). Set by ble_phy_wch.c only. */
 void wch_rf_auto_arm_rx(bool en);
 bool wch_rf_auto_arm_rx_get(void);
 
-/* PHY mode in use for TX/RX (1 = 1M, 2 = 2M; coded not supported in v1) */
+/*
+ * PHY mode in use for TX/RX.  Values are the NimBLE controller modes
+ * (ble_phy.h): 0 = coded S=2 (500 kbps), 1 = 1M, 2 = 2M, 3 = coded S=8
+ * (125 kbps).  Both coded modes are supported.
+ */
 void wch_rf_phy_mode_set(uint8_t tx_mode, uint8_t rx_mode);
 uint8_t wch_rf_phy_mode_tx_get(void);
 uint8_t wch_rf_phy_mode_rx_get(void);

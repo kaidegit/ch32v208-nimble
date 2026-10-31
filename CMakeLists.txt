@@ -153,6 +153,7 @@ add_library(wch_ble STATIC
     drivers/wch_ble/ble_hw_wch.c
     port/hal_timer_wch.c
     port/nimble_port_wch.c
+    port/ble_ll_coded.c
     # Software AES-128 + CMAC behind the config/mbedtls/ headers; NimBLE's
     # ble_ll_crypto.c / ble_sm_alg.c include <mbedtls/cmac.h> unconditionally.
     port/crypto_mbedtls_shim.c
@@ -192,6 +193,7 @@ target_link_libraries(ch32v208_nimble
 target_include_directories(ch32v208_nimble PRIVATE app port)
 target_link_options(ch32v208_nimble PRIVATE
     -T${CMAKE_CURRENT_SOURCE_DIR}/ld/Link.ld
+    -Wl,--wrap=ble_ll_conn_hci_le_set_phy
     -Wl,--gc-sections
     -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/ch32v208_nimble.map
     -Wl,--print-memory-usage

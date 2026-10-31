@@ -28,6 +28,15 @@ def snooz(version):
 
 
 class PhoneDiagnosticsTests(unittest.TestCase):
+    def test_phy_status_rejects_stale_coded_selector(self):
+        for selector, phy in ((1, 1), (2, 2), (3, 3), (4, 3)):
+            status = bytes((1, phy, phy, 0, 0, selector))
+            self.assertTrue(ble.phy_status_matches(status, selector))
+            self.assertFalse(ble.phy_status_matches(status[:3] + b'\x01' + status[4:], selector))
+        self.assertFalse(ble.phy_status_matches(bytes.fromhex('010303000003'), 4))
+        self.assertFalse(ble.phy_status_matches(bytes.fromhex('010303000004'), 3))
+        self.assertFalse(ble.phy_status_matches(b'', 4))
+
     def test_hci_primary_response_and_rssi(self):
         for version in (1, 2):
             with self.subTest(version=version):

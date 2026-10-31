@@ -62,17 +62,19 @@
 #define MYNEWT_VAL_OS_CPUTIME_TIMER_NUM (0)
 
 /* ------------------------------------------------- controller features ----
- * v1 bring-up: single connection, no extended advertising / privacy /
- * coded PHY.  1M/2M enabled for on-air rate verification. Encryption on
- * (SMP legacy + LE secure Pairing Request
- * feature bits); DTM on for RF verification. */
+ * v1 bring-up: single connection, no extended advertising / privacy.
+ * 1M/2M/coded enabled for on-air rate verification (coded: conn RX demod
+ * group + TX windows transcribed from BLE_SetPHYTx/RxMode 0x135ba/0x13714).
+ * Encryption on (SMP legacy + LE secure Pairing Request feature bits);
+ * DTM on for RF verification. */
 #define MYNEWT_VAL_BLE_MAX_CONNECTIONS (1)          /* host syscfg.yml; vendored syscfg.h:827 = 1. NOTE: master has no BLE_LL_MAX_CONNECTIONS (verified by grep) */
 #define MYNEWT_VAL_BLE_LL_CFG_FEAT_LE_ENCRYPTION (1)   /* controller/syscfg.yml:241 default is already 1 for C||P; explicit */
 #define MYNEWT_VAL_BLE_LL_CFG_FEAT_LL_EXT_ADV (0)      /* controller/syscfg.yml:307 = BLE_EXT_ADV = 0 */
 #define MYNEWT_VAL_BLE_LL_CFG_FEAT_LL_PRIVACY (0)      /* controller/syscfg.yml:286 default 1 -> overridden off */
 #define MYNEWT_VAL_BLE_PHY_2M (1)
 #define MYNEWT_VAL_BLE_LL_CFG_FEAT_LE_2M_PHY (1)       /* controller advertises and negotiates LE 2M */
-#define MYNEWT_VAL_BLE_LL_CFG_FEAT_LE_CODED_PHY (0)    /* controller/syscfg.yml:302 = BLE_PHY_CODED = 0 */
+#define MYNEWT_VAL_BLE_PHY_CODED (1)                   /* controller/syscfg.yml:302 = BLE_PHY_CODED */
+#define MYNEWT_VAL_BLE_LL_CFG_FEAT_LE_CODED_PHY (1)    /* controller advertises and negotiates LE Coded S=2/S=8 */
 #define MYNEWT_VAL_BLE_LL_DTM (1)                      /* controller/syscfg.yml:408 default 0 -> overridden on (RF bring-up) */
 #define MYNEWT_VAL_BLE_LL_WHITELIST_SIZE (8)           /* controller/syscfg.yml:102 default '8'; explicit */
 #define MYNEWT_VAL_BLE_LL_SCA (50)                     /* HSE-derived cputime; match EVT's external-crystal 50 ppm budget, not a measured 20 ppm claim. */
@@ -148,7 +150,7 @@
 #define MYNEWT_VAL_BLE_LL_HCI_VS_EVENT_ON_ASSERT (0)    /* yml:465-470 default 0 (vals block yml:696 only for !BLE_HOST) */
 #define MYNEWT_VAL_BLE_LL_EXT_ADV_ADVA_IN_AUX (1)       /* yml:668-672 (inert while EXT_ADV=0) */
 #define MYNEWT_VAL_BLE_LL_STACK_SIZE (120)              /* yml:674-677 (200 only with ISO broadcaster, yml:691) */
-#define MYNEWT_VAL_BLE_LL_PHY (1)                       /* Keep LL PHY negotiation; 1M/2M supported, coded disabled. */
+#define MYNEWT_VAL_BLE_LL_PHY (1)                       /* LL PHY negotiation; 1M/2M/coded supported. */
 #define MYNEWT_VAL_BLE_LL_CHANNEL_SOUNDING (0)          /* = BLE_CHANNEL_SOUNDING = 0 */
 #define MYNEWT_VAL_BLE_LL_ISO (0)                       /* yml:519-527 = BLE_ISO = 0 */
 #define MYNEWT_VAL_BLE_LL_ISO_BROADCASTER (0)           /* yml:528-535 default 0 */

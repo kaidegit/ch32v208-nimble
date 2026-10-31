@@ -26,6 +26,7 @@
 #include "nimble/nimble_opt.h"
 #include "controller/ble_phy.h"
 #include "controller/ble_ll.h"
+#include "controller/ble_ll_pdu.h"
 
 #include "wch_rf.h"
 
@@ -45,7 +46,7 @@ struct ble_phy_obj
     uint8_t phy_encrypted;      /* link encryption armed                  */
     uint8_t phy_privacy;        /* resolv list enabled flag               */
     uint8_t phy_chan;           /* current BLE channel 0..39              */
-    uint8_t phy_tx_phy_mode;    /* BLE_PHY_MODE_1M / _2M                  */
+    uint8_t phy_tx_phy_mode;    /* BLE_PHY_MODE_* (coded 500k=0, 125k=3)  */
     uint8_t phy_rx_phy_mode;
     uint8_t phy_dtm;            /* DTM mode flag (demod cfg, RE §4.4)     */
     uint32_t phy_access_address;
@@ -72,13 +73,18 @@ struct ble_phy_stats
     uint32_t rx_crc_err;
     uint32_t rx_late;
     uint32_t rx_timeouts;
+    uint32_t rx_partial_timeouts;
     uint32_t radio_state_errs;
     uint32_t no_bufs;
     uint32_t hw_errs;
     uint32_t tx_good_1m;
     uint32_t tx_good_2m;
+    uint32_t tx_good_coded_s2;
+    uint32_t tx_good_coded_s8;
     uint32_t rx_valid_1m;
     uint32_t rx_valid_2m;
+    uint32_t rx_valid_coded_s2;
+    uint32_t rx_valid_coded_s8;
 };
 
 static struct ble_phy_stats g_ble_phy_stats;
@@ -163,11 +169,16 @@ load32_le(const uint8_t *p)
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/* Generous hardware TX busy-window: preamble+AA+CRC ~ 80 us + 8 us/byte. */
+/*
+ * TX busy-window bound (half-us): full frame airtime of hdr+payload at the
+ * current TX mode plus a small guard.  wch_rf_tx_basic() derives its final
+ * deadline from the vendor window it programs from the same payload length.
+ */
 static uint32_t
-tx_window_half_us(uint8_t pyld_len)
+tx_window_half_us(uint8_t mode, uint8_t pyld_len)
 {
-    uint32_t airtime_us = 80UL + 8UL * ((uint32_t)pyld_len + 2UL);
+    uint32_t airtime_us =
+        ble_ll_pdu_us(pyld_len, mode);
 
     return 2UL * airtime_us + 100UL;
 }
@@ -176,7 +187,28 @@ tx_window_half_us(uint8_t pyld_len)
 static uint32_t
 rx_window_default_half_us(void)
 {
+    if (g_ble_phy_data.phy_rx_phy_mode == BLE_PHY_MODE_CODED_125KBPS ||
+        g_ble_phy_data.phy_rx_phy_mode == BLE_PHY_MODE_CODED_500KBPS) {
+        return g_wch_rf_timing.wfr_half_us_coded +
+               g_wch_rf_timing.rx_window_widen_half_us_coded;
+    }
     return g_wch_rf_timing.wfr_half_us_1m + g_wch_rf_timing.rx_window_widen_half_us;
+}
+
+/* Address-match allowance (us): preamble+AA(+CI/TERM1) detection time. */
+static uint32_t
+addr_match_us(uint8_t mode)
+{
+    switch (mode) {
+    case BLE_PHY_MODE_2M:
+        return 24U;
+    case BLE_PHY_MODE_CODED_125KBPS:
+    case BLE_PHY_MODE_CODED_500KBPS:
+        /* Vendor C_PHY coded = 0x189 (393 us, RE §12.1 anchor math). */
+        return 393U;
+    default:
+        return 40U;
+    }
 }
 
 /*
@@ -263,18 +295,37 @@ phy_tx_done_isr(uint32_t ts)
     }
 
     ++g_ble_phy_stats.tx_good;
-    if (g_ble_phy_data.phy_tx_phy_mode == BLE_PHY_MODE_2M) {
+    switch (g_ble_phy_data.phy_tx_phy_mode) {
+    case BLE_PHY_MODE_2M:
         ++g_ble_phy_stats.tx_good_2m;
-    } else {
+        break;
+    case BLE_PHY_MODE_CODED_500KBPS:
+        ++g_ble_phy_stats.tx_good_coded_s2;
+        break;
+    case BLE_PHY_MODE_CODED_125KBPS:
+        ++g_ble_phy_stats.tx_good_coded_s8;
+        break;
+    default:
         ++g_ble_phy_stats.tx_good_1m;
+        break;
     }
     if (transition == BLE_PHY_TRANSITION_TX_RX) {
         /* Basic sequencer stages have unambiguous completion flags.
          * Listen after TX while the controller waits for a scan/connect
-         * request; the bounded WFR callback also closes an empty window. */
+         * request; the bounded WFR callback also closes an empty window.
+         * Coded responses need the full T_IFS + 376us sync (vendor 0x43E
+         * total window, RE §12.1); 1M/2M keep the measured 251us window. */
         g_ble_phy_data.phy_state = BLE_PHY_STATE_RX;
         g_ble_phy_data.phy_rx_started = 0;
-        uint32_t window_us = BLE_LL_IFS + g_wch_rf_timing.ack_window_half_us_1m / 2U;
+        uint32_t window_us;
+        if (g_ble_phy_data.phy_tx_phy_mode == BLE_PHY_MODE_CODED_125KBPS ||
+            g_ble_phy_data.phy_tx_phy_mode == BLE_PHY_MODE_CODED_500KBPS) {
+            window_us = g_wch_rf_timing.ack_window_half_us_coded / 2U +
+                        BLE_LL_IFS;
+        } else {
+            window_us = BLE_LL_IFS +
+                        g_wch_rf_timing.ack_window_half_us_1m / 2U;
+        }
         if (wch_rf_rx_basic(g_ble_phy_rx_buf, WCH_RF_RX_BUFFER_SIZE,
                             window_us * 2U) != 0) {
             phy_rx_timeout_isr();
@@ -288,6 +339,40 @@ phy_tx_done_isr(uint32_t ts)
     if (g_ble_phy_data.txend_cb) {
         g_ble_phy_data.txend_cb(g_ble_phy_data.txend_arg);
     }
+}
+
+/* BB clock-capture decision latency measured on this board (2026-10-30,
+ * g_wch_rf_rxdiag over 1M connection frames: capture->rx-done delta ==
+ * payload airtime - 18 us for every length).  The vendor's coded C_PHY
+ * 0x189 = 393 us = 376 us sync + 17 us is consistent with this offset. */
+#define PHY_CLKCAP_DECISION_LATENCY_US  18U
+
+/*
+ * Frame-start timestamp for the LL (ble_hdr->beg_cputime).
+ *
+ * 1M/2M: infer from completed airtime (validated on air with phones).
+ * Coded: infer from the BB clock capture (access-address match) instead.
+ * This ISR event timestamp is coding-independent; the demod follows CI.
+ * It uses a measured delay correction, not a hardware-latched start time.
+ * Coding preference controls local TX. The Android central observed here
+ * sends S=8 while this peripheral sends S=2; deriving the RX start from
+ * S=2 airtime would drift the anchor by 258 + 48*payload_len us and can
+ * cause a supervision timeout.
+ */
+static uint32_t
+rx_beg_cputime(uint32_t rx_done_ts, uint8_t rx_len, uint8_t mode)
+{
+    uint32_t airtime_us = ble_ll_pdu_us(rx_len, mode);
+
+    if (mode != BLE_PHY_MODE_CODED_125KBPS &&
+        mode != BLE_PHY_MODE_CODED_500KBPS) {
+        return rx_done_ts - airtime_us;
+    }
+    if (wch_rf_rx_captured()) {
+        return wch_rf_last_anchor() -
+               ble_ll_pdu_syncword_us(mode) - PHY_CLKCAP_DECISION_LATENCY_US;
+    }
+    return rx_done_ts - airtime_us;     /* no capture: best effort */
 }
 
 static void
@@ -308,18 +393,29 @@ phy_rx_done_isr(uint32_t ts)
     ++g_ble_phy_stats.rx_starts;
 
     /* BB clock capture is after address detection, not the first preamble
-     * bit. Infer packet start from completed airtime instead of handing that
-     * later capture point to the connection scheduler as its anchor. */
+     * bit. The LL adds back ble_ll_pdu_us(payload, conn rx mode) to
+     * beg_cputime, so the mode used here must be the LL's negotiated one
+     * (it is: ble_ll_conn calls ble_phy_mode_set(tx, rx) with the conn
+     * modes every event). */
     ble_hdr->rxinfo.flags = ble_ll_state_get();
     ble_hdr->rxinfo.channel = g_ble_phy_data.phy_chan;
     ble_hdr->rxinfo.handle = 0;
     ble_hdr->rxinfo.rssi = wch_rf_rssi();
     ble_hdr->rxinfo.phy_mode = g_ble_phy_data.phy_rx_phy_mode;
-    ble_hdr->rxinfo.phy = ble_hdr->rxinfo.phy_mode == BLE_PHY_MODE_2M ?
-                          BLE_PHY_2M : BLE_PHY_1M;
-    uint32_t airtime_us = ble_hdr->rxinfo.phy_mode == BLE_PHY_MODE_2M ?
-                          4U * (rxbuf[1] + 11U) : 8U * (rxbuf[1] + 10U);
-    ble_hdr->beg_cputime = ts - airtime_us;
+    switch (g_ble_phy_data.phy_rx_phy_mode) {
+    case BLE_PHY_MODE_2M:
+        ble_hdr->rxinfo.phy = BLE_PHY_2M;
+        break;
+    case BLE_PHY_MODE_CODED_125KBPS:
+    case BLE_PHY_MODE_CODED_500KBPS:
+        ble_hdr->rxinfo.phy = BLE_PHY_CODED;
+        break;
+    default:
+        ble_hdr->rxinfo.phy = BLE_PHY_1M;
+        break;
+    }
+    ble_hdr->beg_cputime = rx_beg_cputime(ts, rxbuf[1],
+                                          g_ble_phy_data.phy_rx_phy_mode);
     ble_hdr->rem_usecs = 0;
 
     /*
@@ -342,10 +438,19 @@ phy_rx_done_isr(uint32_t ts)
         ble_hdr->rxinfo.flags |= BLE_MBUF_HDR_F_CRC_OK;
         ++g_ble_phy_stats.rx_valid;
         phy_trace_control(0, rxbuf);
-        if (g_ble_phy_data.phy_rx_phy_mode == BLE_PHY_MODE_2M) {
+        switch (g_ble_phy_data.phy_rx_phy_mode) {
+        case BLE_PHY_MODE_2M:
             ++g_ble_phy_stats.rx_valid_2m;
-        } else {
+            break;
+        case BLE_PHY_MODE_CODED_500KBPS:
+            ++g_ble_phy_stats.rx_valid_coded_s2;
+            break;
+        case BLE_PHY_MODE_CODED_125KBPS:
+            ++g_ble_phy_stats.rx_valid_coded_s8;
+            break;
+        default:
             ++g_ble_phy_stats.rx_valid_1m;
+            break;
         }
     } else {
         ++g_ble_phy_stats.rx_crc_err;
@@ -364,18 +469,17 @@ phy_rx_timeout_isr(void)
         return;
     }
 
-    if (!g_ble_phy_data.phy_rx_started) {
-        /* Nothing received: wfr expiry.  Same pattern as nrf5x
-         * ble_phy_isr DISABLED-without-start -> ble_ll_wfr_timer_exp. */
-        ble_phy_disable();
-        ++g_ble_phy_stats.rx_timeouts;
-        ble_ll_wfr_timer_exp(NULL);
-    } else {
-        /* Frame started but engine reports timeout - treat as HW error. */
-        ble_phy_disable();
-        ++g_ble_phy_stats.hw_errs;
-        ble_ll_hw_error();
+    if (g_ble_phy_data.phy_rx_started) {
+        /* Address capture is not a complete, CRC-checked packet. A partial
+         * or falsely detected frame can exhaust the bounded RX window.
+         * Drop this reception and let the LL close the event normally;
+         * reporting HCI sync loss here reset the entire host (0x601). */
+        ++g_ble_phy_stats.rx_aborts;
+        ++g_ble_phy_stats.rx_partial_timeouts;
     }
+    ble_phy_disable();              /* clears rx_started before the LL WFR */
+    ++g_ble_phy_stats.rx_timeouts;
+    ble_ll_wfr_timer_exp(NULL);
 }
 
 static void
@@ -576,7 +680,8 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
 
     rc = wch_rf_tx_basic(g_ble_phy_tx_buf,
                          (uint16_t)(pyld_len + BLE_LL_PDU_HDR_LEN),
-                         tx_window_half_us(pyld_len));
+                         tx_window_half_us(g_ble_phy_data.phy_tx_phy_mode,
+                                           pyld_len));
     if (rc != 0) {
         if (g_ble_phy_stats.tx_fail == 0) {
             g_wch_phy_tx_fail_snapshot[0] = WCH_LLE_CMD;
@@ -735,7 +840,7 @@ ble_phy_wfr_enable(int txrx, uint8_t tx_phy_mode, uint32_t wfr_usecs)
 {
     uint32_t window;
 
-    (void)tx_phy_mode;  /* 1M only in v1 */
+    (void)tx_phy_mode;  /* the LL leaves it 0; we use our own rx mode */
 
     if (txrx == BLE_PHY_WFR_ENABLE_TXRX) {
         /*
@@ -757,9 +862,9 @@ ble_phy_wfr_enable(int txrx, uint8_t tx_phy_mode, uint32_t wfr_usecs)
     /* WFR is relative to the requested on-air RX start, not to the early
      * scheduler callback or the instant we program the receiver. Include
      * preamble/access-address detection and the existing capture allowance. */
-    uint32_t addr_us = g_ble_phy_data.phy_rx_phy_mode == BLE_PHY_MODE_2M ? 24U : 40U;
+    uint32_t addr_us = addr_match_us(g_ble_phy_data.phy_rx_phy_mode);
     uint32_t deadline = s_rx_air_start_cputime + wfr_usecs + addr_us +
-                       g_wch_rf_timing.rx_window_widen_half_us / 2U;
+                        g_wch_rf_timing.rx_window_widen_half_us / 2U;
     int32_t remaining = (int32_t)(deadline - os_cputime_get32());
     if (remaining < 1) {
         remaining = 1;
@@ -866,21 +971,32 @@ ble_phy_resolv_list_disable(void)
 
 /* Unconditional: upstream ble_ll_adv/conn/scan call sites are not feature-
  * gated, so the symbol must exist even when optional PHYs are disabled.
- * Coded modes remain unsupported; 1M and 2M map directly to WCH modes. */
+ * Modes map onto the WCH PHY bits via wch_rf_phy_mode_set (coded included). */
 void
 ble_phy_mode_set(uint8_t tx_phy_mode, uint8_t rx_phy_mode)
 {
-    /* Coded modes clamp to 1M in v1 (see wch_rf_phy_mode_set). */
     wch_rf_phy_mode_set(tx_phy_mode, rx_phy_mode);
-    if (tx_phy_mode == BLE_PHY_MODE_2M) {
-        g_ble_phy_data.phy_tx_phy_mode = BLE_PHY_MODE_2M;
-    } else {
+    /* Clamp to the four defined NimBLE modes for the local mode bookkeeping
+     * (LL only ever passes 0..3; guard against surprises). */
+    switch (tx_phy_mode) {
+    case BLE_PHY_MODE_2M:
+    case BLE_PHY_MODE_CODED_500KBPS:
+    case BLE_PHY_MODE_CODED_125KBPS:
+        g_ble_phy_data.phy_tx_phy_mode = tx_phy_mode;
+        break;
+    default:
         g_ble_phy_data.phy_tx_phy_mode = BLE_PHY_MODE_1M;
+        break;
     }
-    if (rx_phy_mode == BLE_PHY_MODE_2M) {
-        g_ble_phy_data.phy_rx_phy_mode = BLE_PHY_MODE_2M;
-    } else {
+    switch (rx_phy_mode) {
+    case BLE_PHY_MODE_2M:
+    case BLE_PHY_MODE_CODED_500KBPS:
+    case BLE_PHY_MODE_CODED_125KBPS:
+        g_ble_phy_data.phy_rx_phy_mode = rx_phy_mode;
+        break;
+    default:
         g_ble_phy_data.phy_rx_phy_mode = BLE_PHY_MODE_1M;
+        break;
     }
 }
 
