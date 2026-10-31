@@ -7,7 +7,7 @@
  *
  * Data flow (runtime logging - never waits for the UART):
  *   caller formats on its own stack (vsnprintf) -> wch_log_write() copies
- *   the bytes into the DMA ring under a short mstatus.MIE-masked window ->
+ *   the bytes into the DMA ring under a short MIE/MPIE-masked window ->
  *   kicks DMA1_CH4 if idle; the TC interrupt advances the tail and chains
  *   the next contiguous ring segment; USART1 shifts bytes out at 921600 8N1.
  *
@@ -17,8 +17,8 @@
  *     covers only the ring memcpy (<= 256 B, same bound the RTT sink had)
  *     and, at most, the DMA kick register writes. It never waits for the
  *     UART, the DMA, the scheduler or a host.
- *   - Producers serialize per call by masking mstatus.MIE (like the old
- *     SEGGER_RTT_LOCK); that single window excludes other tasks AND
+ *   - Producers serialize per call by saving/masking MIE and MPIE through
+ *     GINTENR; that single window excludes other tasks AND
  *     interrupt-context producers by construction.
  *   - The DMA TC ISR only consumes (tail, g_dma_end/busy, descriptor);
  *     producers only produce (head). g_log_head is published with a fence
@@ -53,6 +53,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "wch_irq.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -116,20 +117,12 @@ static void wch_log_panic_write( const char *p, size_t n );
 
 static inline uint32_t log_irq_save( void )
 {
-    uint32_t prior;
-
-    /* QingKe V4: mask machine interrupts by clearing mstatus.MIE (bit 3). */
-    __asm__ volatile ( "csrrc %0, mstatus, %1; fence.i"
-                       : "=r"( prior ) : "r"( 1UL << 3 ) : "memory" );
-    return prior & ( 1UL << 3 );
+    return wch_irq_save();
 }
 
 static inline void log_irq_restore( uint32_t mie )
 {
-    if( mie )
-    {
-        __asm__ volatile ( "csrs mstatus, %0" :: "r"( 1UL << 3 ) : "memory" );
-    }
+    wch_irq_restore(mie);
 }
 
 /* ---------------------------------------------------------------- */

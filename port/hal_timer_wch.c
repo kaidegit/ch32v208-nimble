@@ -7,25 +7,23 @@
  * of struct hal_timer, CH1 output-compare programmed to the head expiry,
  * and the ISR popping expired entries and re-programming CH1CVR.
  *
- * Register-level operation (no SDK library calls; only SDK type/layout
- * headers are included):
+ * Register-level timer operation; RCC_GetClocksFreq reads the clock tree:
  *   - TIM3 clock: RCC->APB1PCENR bit1 (RCC_TIM3EN).
  *   - Counter clock: PCLK1 x 2 (x2 applies because APB1 is always
  *     prescaled on this design; the x1 case is handled anyway), derived
- *     at runtime from SystemCoreClock and RCC->CFGR PPRE1[10:8], so any
- *     SYSCLK the boot code chooses still yields exactly 1 MHz.
+ *     at runtime from RCC_GetClocksFreq and RCC->CFGR PPRE1[10:8]. A clock
+ *     that cannot divide exactly to the requested tick rate is rejected.
  *   - PSC -> 1 MHz, ATRLR = 0xFFFF (free-running 16-bit).
  *   - UIE: update interrupt bumps g_high_word -> 32-bit software time.
  *   - CC1IE + CH1CVR: one-shot compare driving the callback queue.
  *
  * Concurrency model: the FreeRTOS WCH port implements critical sections
- * by clearing mstatus.MIE globally (vPortEnterCritical), which means *any*
+ * by clearing MIE/MPIE through GINTENR (vPortEnterCritical), so *any*
  * interrupt priority is safe with respect to FreeRTOS and with respect to
  * this timer's list.  Because these helpers are also called from the TIM3
- * ISR itself (where MIE is already 0 and re-enabling inside the ISR would
- * permit premature nesting), a tiny csrrc/csrw-mstatus lock is used
- * instead of vPortEnterCritical - semantically identical on this port,
- * and ISR-safe.
+ * ISR itself, saved-state locks are used instead of changing the task's
+ * nesting counter. QingKe does not automatically clear MIE on ISR entry;
+ * preserving both MIE/MPIE also preserves the state restored by MRET.
  *
  * NVIC: TIM3_IRQn == 45.  Priority programmed directly into PFIC->IPRIOR
  * (QingKe V4: 1 byte per IRQ; per the WCH SDK ch32v20x_misc.c convention
@@ -43,6 +41,7 @@
 #include "syscfg/syscfg.h"
 #include "hal/hal_timer.h"
 #include "hal_timer_wch.h"
+#include "wch_irq.h"
 
 #define WCH_TIM_PRESCALE_HZ     (1000000u)      /* target cputime clock */
 
@@ -63,17 +62,13 @@ static struct wch_hal_timer g_wch_timer;
 static inline uint32_t
 wch_irq_lock(void)
 {
-    uint32_t mstatus;
-
-    __asm__ volatile ("csrrc %0, mstatus, %1; fence.i"
-                      : "=r" (mstatus) : "r" (0x8) : "memory");
-    return mstatus;
+    return wch_irq_save();
 }
 
 static inline void
 wch_irq_unlock(uint32_t mstatus)
 {
-    __asm__ volatile ("csrw mstatus, %0" :: "r" (mstatus) : "memory");
+    wch_irq_restore(mstatus);
 }
 
 /* ------------------------------------------------------------- hw access */
@@ -81,24 +76,17 @@ wch_irq_unlock(uint32_t mstatus)
 static uint32_t
 wch_timer_input_freq(void)
 {
-    uint32_t sysclk = SystemCoreClock;
+    RCC_ClocksTypeDef clocks;
     uint32_t ppre1;
 
-    if (sysclk == 0) {
-        sysclk = 48000000u;             /* boot-time fallback */
-    }
+    RCC_GetClocksFreq(&clocks);
 
     ppre1 = RCC->CFGR0 & RCC_PPRE1;     /* bits [10:8] */
     if (ppre1 == RCC_PPRE1_DIV1) {
-        return sysclk;                  /* APB1 not divided: timer = PCLK1 */
+        return clocks.PCLK1_Frequency;
     }
     /* APB1 prescaled: the timer clock is PCLK1 * 2 */
-    switch (ppre1) {
-    case RCC_PPRE1_DIV2:  return (sysclk / 2) * 2;
-    case RCC_PPRE1_DIV4:  return (sysclk / 4) * 2;
-    case RCC_PPRE1_DIV8:  return (sysclk / 8) * 2;
-    default:              return (sysclk / 16) * 2;
-    }
+    return clocks.PCLK1_Frequency * 2U;
 }
 
 /* Consume pending overflow under the same IRQ lock as the ISR. PHY start
@@ -241,6 +229,9 @@ hal_timer_config(int timer_num, uint32_t freq_hz)
     }
 
     tmrclk = wch_timer_input_freq();
+    if (tmrclk == 0 || tmrclk % freq_hz != 0) {
+        return EINVAL; /* LL microseconds require an exact time base */
+    }
     div = (tmrclk + freq_hz - 1) / freq_hz;     /* ceil */
     if (div == 0) {
         div = 1;

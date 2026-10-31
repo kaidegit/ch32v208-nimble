@@ -132,14 +132,14 @@ static void phy_wfr_expired(void *arg)
 /* Software scheduling (v1 timing model) */
 static uint32_t s_rx_end_cputime;
 static uint8_t s_rx_end_payload_len;
-/* Software wait from RX done before RF preparation on the 96 MHz board.
- * The RF path also includes ~34 us hardware start latency. Scope-level
- * timing/conformance and other clock rates remain unvalidated. */
-/* OPPO/Qualcomm active scanning rejects the earlier 108us SCAN_RSP path.
- * A tagged 70..132us sweep produced valid Android HCI responses at110..132;
- * use120us inside that observed window for the shared RX->TX path.
- * This is a measured interoperability setting, not an air-level IFS proof. */
+/* RX_DONE timestamp -> TX command deadline, in TIM3 microseconds. RF/packet
+ * preparation happens BEFORE the wait in wch_rf_tx_basic(), so its execution
+ * time is no longer added to this interval as CPU frequency changes. The
+ * separate RF startup delay is driven by the unchanged 32 MHz HSE. This
+ * interoperability setting still needs instrument-level T_IFS validation. */
 volatile uint32_t g_wch_phy_response_delay_us = 120;
+volatile uint32_t g_wch_phy_response_elapsed_us[4];
+extern volatile uint32_t g_wch_rf_tx_start_cputime;
 /* First TX failure, before recovery: command, IRQ status, window, BB control. */
 volatile uint32_t g_wch_phy_tx_fail_snapshot[4];
 static uint8_t s_tx_sched_valid;
@@ -341,11 +341,13 @@ phy_tx_done_isr(uint32_t ts)
     }
 }
 
-/* BB clock-capture decision latency measured on this board (2026-10-30,
- * g_wch_rf_rxdiag over 1M connection frames: capture->rx-done delta ==
- * payload airtime - 18 us for every length).  The vendor's coded C_PHY
- * 0x189 = 393 us = 376 us sync + 17 us is consistent with this offset. */
-#define PHY_CLKCAP_DECISION_LATENCY_US  18U
+/* Learn BB-capture -> RX_DONE timestamp bias from CRC-valid 1M packets.
+ * Both timestamps are taken by software, so using a fixed 96 MHz correction
+ * also bakes in that build's ISR overhead. Every connection starts at 1M,
+ * allowing calibration before switching to coded (whose RX CI can vary). */
+volatile uint32_t g_wch_phy_capture_latency_us;
+volatile uint32_t g_wch_phy_capture_samples;
+static uint32_t s_capture_latency_q3;
 
 /*
  * Frame-start timestamp for the LL (ble_hdr->beg_cputime).
@@ -366,11 +368,28 @@ rx_beg_cputime(uint32_t rx_done_ts, uint8_t rx_len, uint8_t mode)
 
     if (mode != BLE_PHY_MODE_CODED_125KBPS &&
         mode != BLE_PHY_MODE_CODED_500KBPS) {
+        if (mode == BLE_PHY_MODE_1M && wch_rf_rx_captured() &&
+            wch_rf_rx_crc_ok()) {
+            uint32_t delta = rx_done_ts - wch_rf_last_anchor();
+            int32_t bias = (int32_t)(airtime_us -
+                            ble_ll_pdu_syncword_us(mode) - delta);
+            /* Ignore delayed/nested ISR samples and unrelated captures. */
+            if (bias >= 0 && bias <= 64) {
+                if (g_wch_phy_capture_samples == 0) {
+                    s_capture_latency_q3 = (uint32_t)bias * 8U;
+                } else {
+                    s_capture_latency_q3 = s_capture_latency_q3 -
+                        (s_capture_latency_q3 + 4U) / 8U + (uint32_t)bias;
+                }
+                g_wch_phy_capture_latency_us = (s_capture_latency_q3 + 4U) / 8U;
+                ++g_wch_phy_capture_samples;
+            }
+        }
         return rx_done_ts - airtime_us;
     }
     if (wch_rf_rx_captured()) {
         return wch_rf_last_anchor() -
-               ble_ll_pdu_syncword_us(mode) - PHY_CLKCAP_DECISION_LATENCY_US;
+               ble_ll_pdu_syncword_us(mode) - g_wch_phy_capture_latency_us;
     }
     return rx_done_ts - airtime_us;     /* no capture: best effort */
 }
@@ -518,6 +537,9 @@ ble_phy_init(void)
 {
     memset(&g_ble_phy_data, 0, sizeof(g_ble_phy_data));
     memset(&g_ble_phy_stats, 0, sizeof(g_ble_phy_stats));
+    g_wch_phy_capture_samples = 0;
+    g_wch_phy_capture_latency_us = 0;
+    s_capture_latency_q3 = 0;
 
     g_ble_phy_data.phy_state = BLE_PHY_STATE_IDLE;
     g_ble_phy_data.phy_chan = BLE_PHY_NUM_CHANS;    /* invalid: forces setchan */
@@ -619,6 +641,7 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
     uint8_t hdr_byte;
     uint8_t pyld_len;
     int rc;
+    uint32_t response_start = 0;
 
     bool response = ble_phy_state_get() == BLE_PHY_STATE_RX &&
                     g_ble_phy_data.phy_rx_started;
@@ -672,16 +695,19 @@ ble_phy_tx(ble_phy_tx_pducb_t pducb, void *pducb_arg, uint8_t end_trans)
             (107U - (93U + 4U * s_rx_end_payload_len)) / 2U : 0U;
         uint32_t delay = g_wch_phy_response_delay_us > short_adjust ?
             g_wch_phy_response_delay_us - short_adjust : 0U;
-        uint32_t start = s_rx_end_cputime + delay;
-        while ((int32_t)(os_cputime_get32() - start) < 0) {
-        }
+        response_start = s_rx_end_cputime + delay;
     }
     g_ble_phy_data.phy_state = BLE_PHY_STATE_TX;
 
     rc = wch_rf_tx_basic(g_ble_phy_tx_buf,
                          (uint16_t)(pyld_len + BLE_LL_PDU_HDR_LEN),
                          tx_window_half_us(g_ble_phy_data.phy_tx_phy_mode,
-                                           pyld_len));
+                                           pyld_len),
+                         response ? &response_start : NULL);
+    if (response && rc == 0) {
+        g_wch_phy_response_elapsed_us[g_ble_phy_data.phy_rx_phy_mode] =
+            g_wch_rf_tx_start_cputime - s_rx_end_cputime;
+    }
     if (rc != 0) {
         if (g_ble_phy_stats.tx_fail == 0) {
             g_wch_phy_tx_fail_snapshot[0] = WCH_LLE_CMD;

@@ -243,8 +243,10 @@ nimble_port_init(void)
      * (poll_reg) and the RNG seed use os_cputime_get32() as their time
      * base - with TIM3 unconfigured it reads a constant 0 and no poll
      * timeout can ever fire. */
-    hal_timer_init(MYNEWT_VAL(OS_CPUTIME_TIMER_NUM), NULL);
-    os_cputime_init(MYNEWT_VAL(OS_CPUTIME_FREQ));
+    int timer_rc = hal_timer_init(MYNEWT_VAL(OS_CPUTIME_TIMER_NUM), NULL);
+    configASSERT(timer_rc == 0);
+    timer_rc = os_cputime_init(MYNEWT_VAL(OS_CPUTIME_FREQ));
+    configASSERT(timer_rc == 0);
     app_dbg_chk("np:3");
 
     console_printf("np:4 hw\n");

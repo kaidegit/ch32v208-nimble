@@ -194,6 +194,7 @@ sw_restore_ok:
 
 	/* Load mstatus with the interrupt enable bits used by the task. */
 	load_x  t0, 29 * portWORD_SIZE( sp )
+	andi    t0, t0, -9                 /* keep MIE off until MRET restores MPIE */
 	csrw mstatus, t0						/* Required for MPIE bit. */
 
 	load_x  x1, 1 * portWORD_SIZE( sp )

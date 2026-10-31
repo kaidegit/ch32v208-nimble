@@ -46,6 +46,7 @@ static uint32_t bb[64], lle[64];
 #undef WCH_REG32
 #define WCH_REG32(base, off) (*((base) == WCH_BB_BASE ? &bb[(off)/4] : &lle[(off)/4]))
 static bool s_dtm;
+void os_cputime_delay_usecs(uint32_t usecs) { (void)usecs; }
 #define BLE_PHY_STATE_RX 2
 static struct { unsigned phy_state, phy_rx_started; } g_ble_phy_data;
 static struct { unsigned rx_aborts, rx_timeouts, rx_partial_timeouts, hw_errs; } g_ble_phy_stats;

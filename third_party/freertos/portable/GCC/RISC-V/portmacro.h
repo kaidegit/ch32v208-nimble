@@ -92,7 +92,8 @@ not need to be guarded with a critical section. */
 
 /* Scheduler utilities. */
 extern void vTaskSwitchContext( void );
-#define portYIELD()   NVIC_SetPendingIRQ(Software_IRQn)
+extern void vPortYield(void);
+#define portYIELD()   vPortYield()
 #define portEND_SWITCHING_ISR( xSwitchRequired ) do { if( xSwitchRequired ) portYIELD(); } while( 0 )
 #define portYIELD_FROM_ISR( x ) portEND_SWITCHING_ISR( x )
 /*-----------------------------------------------------------*/
@@ -106,8 +107,9 @@ extern void vPortClearInterruptMask(portUBASE_TYPE uvalue);
 
 #define portSET_INTERRUPT_MASK_FROM_ISR()  xPortSetInterruptMask()
 #define portCLEAR_INTERRUPT_MASK_FROM_ISR( uxSavedStatusValue )  vPortClearInterruptMask(uxSavedStatusValue)
-#define portDISABLE_INTERRUPTS()	__asm volatile( "csrw mstatus,%0; fence.i" ::"r"(0x1800) : "memory" )
-#define portENABLE_INTERRUPTS()		__asm volatile( "csrw mstatus,%0" ::"r"(0x1888) : "memory" )
+#include "wch_irq.h"
+#define portDISABLE_INTERRUPTS() ((void)wch_irq_save())
+#define portENABLE_INTERRUPTS() wch_irq_restore(0x88U)
 #define portENTER_CRITICAL()	vPortEnterCritical()
 #define portEXIT_CRITICAL()		vPortExitCritical()
 /*-----------------------------------------------------------*/

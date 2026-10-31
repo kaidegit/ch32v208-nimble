@@ -34,6 +34,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "portmacro.h"
+#include "wch_irq.h"
 
 /* Standard includes. */
 #include "string.h"
@@ -81,6 +82,9 @@ interrupt stack after the scheduler has started. */
 #endif
 
 static UBaseType_t uxCriticalNesting = 0xaaaaaaaa;
+static volatile UBaseType_t uxCriticalSavedMask;
+static volatile UBaseType_t uxYieldDeferred;
+volatile UBaseType_t g_port_yield_bad_mask;
 /*
  * Setup the timer to generate the tick interrupts.  The implementation in this
  * file is weak to allow application writers to change the timer used to
@@ -220,6 +224,8 @@ extern void xPortStartFirstTask( void );
 
     /* Initialise the critical nesting count ready for the first task. */
     uxCriticalNesting = 0;
+    uxCriticalSavedMask = 0x88U;
+    uxYieldDeferred = 0;
 	xPortStartFirstTask();
 
 	/* Should not get here as after calling xPortStartFirstTask() only tasks
@@ -257,21 +263,24 @@ void SysTick_Handler( void )
         __asm volatile("csrr %0, mepc" : "=r"(g_tick_sample_pc));
     }
 
+    UBaseType_t saved_mask = portSET_INTERRUPT_MASK_FROM_ISR();
     GET_INT_SP();
-    portDISABLE_INTERRUPTS();
     SysTick->SR=0;
     if( xTaskIncrementTick() != pdFALSE )
     {
         portYIELD();
     }
-    portENABLE_INTERRUPTS();
     FREE_INT_SP();
+    portCLEAR_INTERRUPT_MASK_FROM_ISR(saved_mask);
 }
 
 /*-----------------------------------------------------------*/
 void vPortEnterCritical( void )
 {
-    portDISABLE_INTERRUPTS();
+    UBaseType_t saved_mask = xPortSetInterruptMask();
+    if (uxCriticalNesting == 0) {
+        uxCriticalSavedMask = saved_mask;
+    }
     uxCriticalNesting++;
 }
 
@@ -283,21 +292,39 @@ void vPortExitCritical( void )
 
     if( uxCriticalNesting == 0 )
     {
-        portENABLE_INTERRUPTS();
+        UBaseType_t saved_mask = uxCriticalSavedMask;
+        if (uxYieldDeferred) {
+            uxYieldDeferred = 0;
+            NVIC_SetPendingIRQ(Software_IRQn);
+        }
+        vPortClearInterruptMask(saved_mask);
     }
+}
+/* FreeRTOS queue paths request yield BEFORE their final critical exit.
+ * Pend SWI only after the outermost exit, never switch with nesting > 0. */
+void vPortYield(void)
+{
+    UBaseType_t saved_mask = xPortSetInterruptMask();
+    if (uxCriticalNesting != 0) {
+        uxYieldDeferred = 1;
+        if (saved_mask & 8U) {
+            ++g_port_yield_bad_mask;
+        }
+    } else {
+        NVIC_SetPendingIRQ(Software_IRQn);
+    }
+    vPortClearInterruptMask(saved_mask);
 }
 /*-----------------------------------------------------------*/
 portUBASE_TYPE xPortSetInterruptMask(void)
 {
-    portUBASE_TYPE uvalue=0;
-    __asm volatile("csrrw %0, mstatus, %1; fence.i":"=r"(uvalue):"r"(0x1800):"memory");
-    return uvalue;
+    return wch_irq_save();
 }
 
 /*-----------------------------------------------------------*/
 void vPortClearInterruptMask(portUBASE_TYPE uvalue)
 {
-    __asm volatile("csrw  mstatus, %0"::"r"(uvalue):"memory");
+    wch_irq_restore(uvalue);
 }
 
 

@@ -6,6 +6,7 @@
 #   scripts/build.sh              # Release build into build/
 #   scripts/build.sh --clean      # wipe build/ first
 #   BUILD_TYPE=Debug scripts/build.sh
+#   SYSCLK_MHZ=144 scripts/build.sh  # 72 / 96 / 144 (default cache: 96)
 #
 # Toolchain: WCH riscv32-wch-elf-gcc; override its location with
 #   WCH_TOOLCHAIN_DIR=/path/to/riscv32-wch-elf-gcc-15 scripts/build.sh
@@ -15,6 +16,10 @@ set -euo pipefail
 PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${PROJ_DIR}/build"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
+CLOCK_ARGS=()
+if [[ -n "${SYSCLK_MHZ:-}" ]]; then
+    CLOCK_ARGS=("-DCH32_SYSCLK_MHZ=${SYSCLK_MHZ}")
+fi
 TOOLCHAIN_FILE="${PROJ_DIR}/cmake/riscv32-wch.toolchain.cmake"
 
 if [[ "${1:-}" == "--clean" ]]; then
@@ -31,7 +36,7 @@ command -v cmake >/dev/null || { echo "cmake not found in PATH" >&2; exit 1; }
 echo "[build] configure: ${BUILD_TYPE}, toolchain=${TOOLCHAIN_FILE}"
 cmake -S "${PROJ_DIR}" -B "${BUILD_DIR}" \
       -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-      -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}"
+      -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" ${CLOCK_ARGS[@]+"${CLOCK_ARGS[@]}"}
 
 echo "[build] compile with ${JOBS} jobs"
 cmake --build "${BUILD_DIR}" -j"${JOBS}"

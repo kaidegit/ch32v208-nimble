@@ -1,10 +1,9 @@
 /*
  * CH32V208 NimBLE bring-up - system/clock init.
  *
- * Copied from WCH EVT EXAM/BLE/RF_PHY/APP/system_ch32v20x.c unchanged
- * except for this banner.  SYSCLK_FREQ_96MHz_HSE is the only enabled
- * option: 32 MHz HSE x3 = 96 MHz core clock, the same setting used by
- * the WCH BLE examples for the CH32V208 (D8W) die.
+ * Based on WCH EVT EXAM/BLE/RF_PHY/APP/system_ch32v20x.c.
+ * CH32_SYSCLK_MHZ selects 72/96/144 MHz from the same 32 MHz HSE.
+ * At 144 MHz APB2 is divided by two to keep ADC input within its range.
  * No VECT_TAB relocation code: the vector table uses the reset mapping;
  * ld/Link.ld links FLASH through its debug-accessible alias at 0x08000000.
  * SystemCoreClockUpdate() tracks the programmed PLL frequency.
@@ -33,7 +32,18 @@
 //#define SYSCLK_FREQ_48MHz_HSE  48000000
 //#define SYSCLK_FREQ_56MHz_HSE  56000000
 //#define SYSCLK_FREQ_72MHz_HSE  72000000
-#define SYSCLK_FREQ_96MHz_HSE  96000000
+#ifndef CH32_SYSCLK_MHZ
+#define CH32_SYSCLK_MHZ 96
+#endif
+#if CH32_SYSCLK_MHZ == 72
+#define SYSCLK_FREQ_72MHz_HSE 72000000
+#elif CH32_SYSCLK_MHZ == 96
+#define SYSCLK_FREQ_96MHz_HSE 96000000
+#elif CH32_SYSCLK_MHZ == 144
+#define SYSCLK_FREQ_144MHz_HSE 144000000
+#else
+#error "CH32_SYSCLK_MHZ must be 72, 96 or 144"
+#endif
 //#define SYSCLK_FREQ_120MHz_HSE  120000000
 //#define SYSCLK_FREQ_144MHz_HSE  144000000
 //#define SYSCLK_FREQ_HSI    HSI_VALUE
@@ -717,8 +727,8 @@ static void SetSysClockTo144_HSE(void)
   {
     /* HCLK = SYSCLK */
     RCC->CFGR0 |= (uint32_t)RCC_HPRE_DIV1;
-    /* PCLK2 = HCLK */
-    RCC->CFGR0 |= (uint32_t)RCC_PPRE2_DIV1;
+    /* PCLK2 = HCLK/2: ADC /8 otherwise exceeds 14 MHz. */
+    RCC->CFGR0 |= (uint32_t)RCC_PPRE2_DIV2;
     /* PCLK1 = HCLK */
     RCC->CFGR0 |= (uint32_t)RCC_PPRE1_DIV2;
 

@@ -200,7 +200,8 @@ static uint16_t
 adc_temp_sample(int *ok)
 {
     ADC_InitTypeDef init;
-    uint32_t guard = 200000;
+    RCC_ClocksTypeDef clocks;
+    uint32_t started;
     uint16_t v = 0;
 
     /* ADC_StructInit leaves ADC_OutputBuffer/ADC_Pga UNfilled - without
@@ -208,8 +209,21 @@ adc_temp_sample(int *ok)
     memset(&init, 0, sizeof(init));
 
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE);
-    /* ADC clock must be <= 14 MHz (RM ch. ADC); PCLK2 is 96 MHz here. */
-    RCC_ADCCLKConfig(RCC_PCLK2_Div8);
+    /* Query the actual peripheral clock. The 144 MHz boot configuration
+     * divides APB2 by two because even ADC /8 cannot accept 144 MHz. */
+    RCC_GetClocksFreq(&clocks);
+    if (clocks.PCLK2_Frequency <= 28000000U) {
+        RCC_ADCCLKConfig(RCC_PCLK2_Div2);
+    } else if (clocks.PCLK2_Frequency <= 56000000U) {
+        RCC_ADCCLKConfig(RCC_PCLK2_Div4);
+    } else if (clocks.PCLK2_Frequency <= 84000000U) {
+        RCC_ADCCLKConfig(RCC_PCLK2_Div6);
+    } else if (clocks.PCLK2_Frequency <= 112000000U) {
+        RCC_ADCCLKConfig(RCC_PCLK2_Div8);
+    } else {
+        *ok = 0;
+        return 0;
+    }
     ADC_TempSensorVrefintCmd(ENABLE);
     ADC_StructInit(&init);
     init.ADC_ScanConvMode = DISABLE;
@@ -219,10 +233,13 @@ adc_temp_sample(int *ok)
     ADC_RegularChannelConfig(ADC1, ADC_Channel_TempSensor, 1,
                              ADC_SampleTime_239Cycles5);
     ADC_Cmd(ADC1, ENABLE);
+    os_cputime_delay_usecs(20); /* ADC and internal temperature sensor settle */
     ADC_SoftwareStartConvCmd(ADC1, ENABLE);
-    while ((ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET) && (--guard)) {
+    started = os_cputime_get32();
+    while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET &&
+           (uint32_t)(os_cputime_get32() - started) < 1000U) {
     }
-    if (guard) {
+    if (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) != RESET) {
         v = ADC_GetConversionValue(ADC1);
         *ok = 1;
     } else {

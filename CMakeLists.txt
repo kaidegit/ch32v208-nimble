@@ -28,6 +28,12 @@ endif()
 
 # --------------------------------------------------------------- options ---
 set(CH32_CHIP "CH32V208WBU6" CACHE STRING "probe-rs chip name used in docs/scripts")
+set(CH32_SYSCLK_MHZ "96" CACHE STRING "HSE-based CPU clock: 72, 96 or 144 MHz")
+set_property(CACHE CH32_SYSCLK_MHZ PROPERTY STRINGS 72 96 144)
+if(NOT CH32_SYSCLK_MHZ MATCHES "^(72|96|144)$")
+    message(FATAL_ERROR "CH32_SYSCLK_MHZ must be 72, 96 or 144")
+endif()
+add_compile_definitions(CH32_SYSCLK_MHZ=${CH32_SYSCLK_MHZ})
 option(CH32_BLE_TEST_IDENTITY "Use a separate static random address for GATT schema testing" OFF)
 
 # ------------------------------------------------------------- flags -------

@@ -270,7 +270,7 @@ static void app_task( void * pvParameters )
 int main( void )
 {
     /* SystemInit() already ran from the reset handler; refresh the
-     * variable from the programmed PLL (96 MHz, 32 MHz HSE x3). */
+     * variable from the programmed HSE/PLL and AHB divider. */
     SystemCoreClockUpdate();
     /* All active BLE timing comes from HSE/PLL -> TIM3 and SysTick.
      * Do not inherit an enabled LSI from a previous firmware. */

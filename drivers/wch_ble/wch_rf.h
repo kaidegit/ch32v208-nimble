@@ -440,9 +440,12 @@ uint8_t wch_rf_channel_get(void);
  *   [0] = PDU header byte, [1] = payload length, [2..] = payload
  * (this is exactly the lib's [pktTxType][txLen][data] frame).  Blocks until
  * actual basic TX-done status (bit1) or a bounded deadline.
- * Returns 0 on success, -1 on timeout / busy.
+ * start_cputime: optional absolute TIM3 deadline for the TX command. All
+ * preparation precedes the wait; the hardware window is loaded afterwards.
+ * Returns 0 on success, -1 on timeout / busy, -2 if more than 10 us late.
  */
-int  wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us);
+int  wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us,
+                     const uint32_t *start_cputime);
 
 /*
  * Basic receive, RE §4.7 (no auto-ack).  Non-blocking: arms the engine and

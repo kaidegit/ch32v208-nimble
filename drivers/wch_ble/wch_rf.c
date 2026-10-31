@@ -64,6 +64,7 @@ static bool s_rx_progress;
  * across S=2 -> S=8 transitions for post-test verification without a probe
  * attached during radio operation. */
 volatile uint32_t g_wch_rf_tx_elapsed_us[4];
+volatile uint32_t g_wch_rf_tx_start_cputime;
 volatile uint8_t g_wch_rf_tx_payload_len[4];
 volatile uint32_t g_wch_rf_tx_rfctrl[4];
 static bool     s_rx_armed;             /* engine waiting for a frame         */
@@ -374,7 +375,7 @@ set_phy_tx_mode(uint8_t mode, uint8_t payload_len)
                     bb_phy_bits_tx(mode);
     uint32_t saved = WCH_RF_GUARD_REG;
     WCH_RF_GUARD_REG = saved & ~0x2000UL;
-    __asm volatile("nop; nop" ::: "memory");
+    os_cputime_delay_usecs(2);
     WCH_LLE_IRQSTAT = 0x2000;
     uint32_t window;
     switch (mode) {
@@ -597,7 +598,8 @@ wch_rf_cfo(void)
  * registration omitted; auto-ack arm bit not set for basic TX).
  */
 int
-wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us)
+wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us,
+                const uint32_t *start_cputime)
 {
     uint32_t deadline;
     int rc = 0;
@@ -634,20 +636,41 @@ wch_rf_tx_basic(const uint8_t *frame, uint16_t n, uint32_t timeout_half_us)
 
     set_phy_tx_mode(s_phy_tx, frame[1]);                      /* BLE_SetPHYTxMode - §4.4  */
 
+    uint32_t hw_window = WCH_LLE_WINDOW;
+    if (start_cputime != NULL) {
+        /* LLE+0x64 is a live countdown, including while software waits.
+         * Do not spend its TX airtime budget before starting the packet. */
+        WCH_LLE_WINDOW = 0;
+        uint32_t now;
+        do {
+            now = os_cputime_get32();
+        } while ((int32_t)(now - *start_cputime) < 0);
+        if ((int32_t)(now - *start_cputime) > 10) {
+            wch_rf_guard_exit();
+            return -2;
+        }
+        WCH_LLE_WINDOW = hw_window;
+    }
+
     /* Launch tail - RE §4.6: BB[0x00] |= 0x800000; BB[0x2C] &= ~3; LLE[0]=2 */
     WCH_BB_RFCTRL |= WCH_BB_RFCTRL_TX_TRIG;
     WCH_BB_AUTOCFG &= ~WCH_BB_AUTOCFG_ARM_MASK;
-    uint32_t hw_window = WCH_LLE_WINDOW;
     (void)timeout_half_us; /* hardware timing comes from payload length */
     uint32_t started = os_cputime_get32();
     WCH_LLE_CMD = WCH_LLE_CMD_START_TX;
+    g_wch_rf_tx_start_cputime = started;
 
     /* Countdown expiry alone is not packet success. The basic TX stage
      * raises bit1, as consumed by rf_tx_basic_txProcess in the vendor lib. */
     deadline = started + hw_window / 2U + 200U;
     while ((WCH_LLE_IRQSTAT & WCH_LLE_IRQ_TX_DONE) == 0) {
         if ((int32_t)(os_cputime_get32() - deadline) >= 0) {
-            rc = -1;
+            /* Completion may arrive between the loop's status read and
+             * its time read (including across preemption/debug pauses).
+             * Only a fresh missing TX_DONE is a timeout. */
+            if ((WCH_LLE_IRQSTAT & WCH_LLE_IRQ_TX_DONE) == 0) {
+                rc = -1;
+            }
             break;
         }
     }

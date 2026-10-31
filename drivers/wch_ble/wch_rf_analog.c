@@ -29,7 +29,9 @@ volatile uint8_t g_wch_rf_analog_ga[3];
 static void
 settle(void)
 {
-    __asm volatile ("nop; nop; nop; nop" ::: "memory");
+    /* TIM3 is already configured at 1 MHz before RF initialization. Allow
+     * a complete microsecond even if the first read is just before a tick. */
+    os_cputime_delay_usecs(2);
 }
 
 /* RFEND_Reset, 0x2ad64..0x2ad96. */
@@ -37,13 +39,9 @@ static void
 rf_reset(void)
 {
     RF(0x0c) = 0x1101;
-    for (volatile unsigned i = 0; i < 20; ++i) {
-        __asm volatile ("nop");
-    }
+    os_cputime_delay_usecs(5);
     RF(0x0c) = 0;
-    for (volatile unsigned i = 0; i < 20; ++i) {
-        __asm volatile ("nop");
-    }
+    os_cputime_delay_usecs(5);
     RF(0x0c) = 0x1101;
 }
 
