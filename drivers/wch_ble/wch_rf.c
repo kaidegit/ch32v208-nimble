@@ -460,6 +460,33 @@ wch_rf_shut(void)
     wch_rf_guard_exit();
 }
 
+/* Match the analogue power policy in WCH tmos_proces_idle.
+ * Normal RF shutdown deliberately leaves bit16 (RX ADC) enabled; idle
+ * sleep additionally gates it. No engine state, calibration or DMA changes. */
+uint32_t
+wch_rf_sleep_prepare(void)
+{
+#if CH32_POWER_RF_GATE
+    uint32_t enabled = WCH_RFEND_FECTRL & WCH_RFEND_FECTRL_RF_ON;
+    WCH_RFEND_FECTRL &= ~WCH_RFEND_FECTRL_RF_ON;
+    wch_fence();
+    return enabled;
+#else
+    return 0;
+#endif
+}
+
+void
+wch_rf_sleep_restore(uint32_t enables)
+{
+#if CH32_POWER_RF_GATE
+    WCH_RFEND_FECTRL = (WCH_RFEND_FECTRL & ~WCH_RFEND_FECTRL_RF_ON) | enables;
+    wch_fence();
+#else
+    (void)enables;
+#endif
+}
+
 /* Analog sequences live separately and use verified byte offsets. */
 extern int wch_rf_analog_init(void);
 extern void wch_rf_analog_dev_init(void);

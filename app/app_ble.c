@@ -64,8 +64,8 @@ static int app_ble_gap_event(struct ble_gap_event *event, void *arg);
 #define APP_BLE_DEV_NAME        "CH32V208-NIMBLE"
 
 /* Legacy advertising interval in BLE units (0.625 ms): 160 -> 100 ms. */
-#define APP_BLE_ADV_ITVL_MIN    160
-#define APP_BLE_ADV_ITVL_MAX    160
+#define APP_BLE_ADV_ITVL_MIN    CH32_ADV_INTERVAL_UNITS
+#define APP_BLE_ADV_ITVL_MAX    CH32_ADV_INTERVAL_UNITS
 
 /* Two-byte vendor field appended to the advertising payload for sniffer
  * identification ('W', 'C'). */

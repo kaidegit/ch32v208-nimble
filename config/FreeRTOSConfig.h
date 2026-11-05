@@ -53,6 +53,17 @@ extern uint32_t SystemCoreClock;
 #define configISR_STACK_SIZE_WORDS      ( 4096 / sizeof( StackType_t ) )
 
 #define configUSE_PREEMPTION            1
+
+/* Use the board's RTC/WFE implementation; FreeRTOS invokes it with the
+ * scheduler suspended. Clocks and timebases must be restored before ISRs. */
+#ifndef CH32_LOW_POWER
+#define CH32_LOW_POWER                  0
+#endif
+#define configUSE_TICKLESS_IDLE         CH32_LOW_POWER
+#define configEXPECTED_IDLE_TIME_BEFORE_SLEEP 2
+extern void wch_power_idle(uint32_t expected_ticks);
+#define portSUPPRESS_TICKS_AND_SLEEP(ticks) wch_power_idle((ticks))
+
 #define configUSE_IDLE_HOOK             0
 #define configUSE_TICK_HOOK             0
 #define configCPU_CLOCK_HZ              ( SystemCoreClock )   /* actual HCLK at scheduler startup */

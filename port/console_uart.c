@@ -567,3 +567,11 @@ void wch_log_init( void )
     }
     elog_start();
 }
+
+/* Called with IRQs masked by the tickless port. TC alone is insufficient:
+ * DMA may have another segment queued while the UART shifts the last byte. */
+int wch_log_can_sleep(void)
+{
+    return !g_panic_mode && !g_dma_busy && g_log_head == g_log_tail &&
+           (USART1->STATR & USART_STATR_TC);
+}

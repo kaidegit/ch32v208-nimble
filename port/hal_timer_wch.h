@@ -18,9 +18,20 @@
 #ifndef H_HAL_TIMER_WCH_H_
 #define H_HAL_TIMER_WCH_H_
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Tickless hooks: the caller holds the global IRQ mask throughout.
+ * next_us: zero when due/uninitialized, UINT32_MAX when the queue is empty.
+ * pause: stop TIM3 and save its current 32-bit time.
+ * resume: add RTC elapsed time, restart TIM3 and rearm the next callback.
+ * Callbacks remain deferred to the ISR after the caller restores IRQs. */
+uint32_t hal_timer_wch_next_us(void);
+uint32_t hal_timer_wch_pause(void);
+void hal_timer_wch_resume(uint32_t elapsed_us);
 
 /* Called from app/ch32v20x_it.c:
  *     void TIM3_IRQHandler(void) { hal_timer_wch_irq(); }

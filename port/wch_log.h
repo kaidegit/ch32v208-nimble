@@ -54,6 +54,8 @@ struct wch_log_stats {
     uint32_t panic_mode;   /* 1 once polled emergency output took over   */
     uint32_t panic_lost;   /* bytes lost in panic mode (TXE spin expiry) */
 };
+/* Caller holds global IRQ mask; never waits for DMA or USART. */
+int wch_log_can_sleep(void);
 void wch_log_get_stats(struct wch_log_stats *out);
 
 /* One object guarantees that the canaries bracket the DMA buffer even

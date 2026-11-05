@@ -16,6 +16,14 @@
 
 各阶段实测数据与排查过程见 [docs/](docs/) 索引。
 
+## 低功耗实验
+
+独立 demo 提供 RUN / SLEEP / STOP 及屏蔽中断的 WFI/WFE 唤醒对照，所有模式复位后先等待 **10 秒**。用法见 [低功耗 demo](docs/low-power-demo.md)。正式 NimBLE 已接入 FreeRTOS tickless STOP，默认使用 HSE 参考测量的 LSI/2 计时；实现、验证范围和开关见 [低功耗说明](docs/low-power.md)。配置选项集中在 `cmake/project-options.cmake`，独立 demo 定义位于 `cmake/low-power-demo.cmake`。
+
+当前板上为静默 **1 秒广播、未用 GPIO 模拟输入**档：`GPIO_ANALOG=ON scripts/power-profile.sh 1000 --flash`。用户截图全段平均约 **77.7 µA**（ME6230 输入端约 4 V），选中区间约 71.7 µA。测量时应拔掉 WCH-Link；此前间歇约 350 µA 平台可能与调试器连接有关，具体机制未验证。完整截图、原厂 BLE_UART 示例的外部参考数据和测量条件见 [低功耗结果](docs/low-power.md)。脚本另支持 500/2000/5000 ms，仍保留复位后 10 秒保护；这些间隔尚无当前 GPIO 配置下的功耗实测。
+
+**当前未用 GPIO 统一设为模拟输入，仅适用于本验证板的测量。实际项目中使用中的 GPIO 可能不应设为模拟输入**，需按数字输入、唤醒、通信和外部电平逐脚配置；当前保留 PA9 UART TX、PC14/PC15 与 PD0/PD1 晶振引脚。脚本不指定 `GPIO_ANALOG=ON` 时仍采用原下拉输入配置。
+
 ## 已知调试坑：RTT 会暂停 CPU
 
 本板经 probe-rs 读取 RTT 实际会反复暂停 CPU，破坏 BLE 微秒级收发时序，曾表现为射频发送失败累积、手机无法连接。因此本项目：
@@ -84,6 +92,8 @@ CPU 主频可通过 `SYSCLK_MHZ=72 scripts/build.sh` 选择 72、96 或 144 MHz�
 | [coded-phy-2026-10-31.md](docs/coded-phy-2026-10-31.md) | LE Coded S=2/S=8 接入、S=2 锚点漂移根因与手机实测 |
 | [coded-review-2026-10-31.md](docs/coded-review-2026-10-31.md) | Coded适配复核、实际编码切换修复、1537硬件错误恢复与错误码勘误 |
 | [l2cap-gatt-perf-2026-10-31.md](docs/l2cap-gatt-perf-2026-10-31.md) | GATT/CoC 上下行饱和吞吐、DLE/流控/连接间隔配置与实机结果 |
+| [low-power.md](docs/low-power.md) | 当前低功耗结果与截图、FreeRTOS STOP/时基恢复、GPIO 适用范围及 BLE_UART 参考数据 |
+| [low-power-demo.md](docs/low-power-demo.md) | 独立裸机唤醒实验、22 µA 平台基线与调试连接恢复 |
 
 ## 其他已知限制
 

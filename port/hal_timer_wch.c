@@ -392,3 +392,48 @@ hal_timer_stop(struct hal_timer *tmr)
     wch_irq_unlock(sr);
     return 0;
 }
+
+/* STOP bridge. The pending-IRQ check in wch_power_idle prevents discarding
+ * a legitimate TIM3 interrupt before this pause. Callbacks stay in the ISR. */
+static uint32_t sleep_count;
+
+uint32_t
+hal_timer_wch_next_us(void)
+{
+    struct hal_timer *head = TAILQ_FIRST(&g_wch_timer.hal_timer_q);
+
+    if (!g_wch_timer.enabled) {
+        return 0;
+    }
+    if (!head) {
+        return UINT32_MAX;
+    }
+    int32_t dt = (int32_t)(head->expiry - wch_timer_read32());
+    return dt > 0 ? (uint32_t)dt : 0;
+}
+
+uint32_t
+hal_timer_wch_pause(void)
+{
+    TIM3->CTLR1 &= ~TIM_CEN;
+    sleep_count = wch_timer_read32();
+    return sleep_count;
+}
+
+void
+hal_timer_wch_resume(uint32_t elapsed_us)
+{
+    uint32_t count = sleep_count + elapsed_us; /* intentional 32-bit wrap */
+
+    g_wch_timer.high_word = count >> 16;
+    TIM3->CNT = count & 0xffff;
+    TIM3->INTFR = 0;
+    NVIC_ClearPendingIRQ(TIM3_IRQn);
+    TIM3->CTLR1 |= TIM_CEN;
+    struct hal_timer *head = TAILQ_FIRST(&g_wch_timer.hal_timer_q);
+    if (head) {
+        wch_timer_set_ocmp(head->expiry);
+    } else {
+        wch_timer_disable_ocmp();
+    }
+}

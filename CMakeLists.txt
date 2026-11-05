@@ -9,7 +9,7 @@
 #                            wch_rf.c : BB / LLE / RFEND / AES
 #                                       register-level driver
 #                                          │
-#                     FreeRTOS + NPL(freertos) + SEGGER RTT log
+#                     FreeRTOS + NPL(freertos) + EasyLogger / USART1 DMA
 #
 cmake_minimum_required(VERSION 3.20)
 
@@ -26,16 +26,8 @@ if(NOT EXISTS ${NIMBLE_DIR}/porting)
     message(FATAL_ERROR "nimble checkout not found at ${NIMBLE_DIR}")
 endif()
 
-# --------------------------------------------------------------- options ---
-set(CH32_CHIP "CH32V208WBU6" CACHE STRING "probe-rs chip name used in docs/scripts")
-set(CH32_SYSCLK_MHZ "96" CACHE STRING "HSE-based CPU clock: 72, 96 or 144 MHz")
-set_property(CACHE CH32_SYSCLK_MHZ PROPERTY STRINGS 72 96 144)
-if(NOT CH32_SYSCLK_MHZ MATCHES "^(72|96|144)$")
-    message(FATAL_ERROR "CH32_SYSCLK_MHZ must be 72, 96 or 144")
-endif()
-add_compile_definitions(CH32_SYSCLK_MHZ=${CH32_SYSCLK_MHZ})
-option(CH32_BLE_TEST_IDENTITY "Use a separate static random address for GATT schema testing" OFF)
-option(CH32_BLE_PACKET_LOGS "Log NimBLE packets and GATT payloads (slows throughput tests)" OFF)
+# Shared configuration and validation.
+include(cmake/project-options.cmake)
 
 # ------------------------------------------------------------- flags -------
 add_compile_options(
@@ -182,6 +174,7 @@ set_source_files_properties(drivers/wch_ble/wch_rf.c
 add_executable(ch32v208_nimble
     port/syscalls.c
     app/main.c
+    port/wch_power.c
     app/app_ble.c
     app/app_perf.c
     app/ch32v20x_it.c
@@ -222,11 +215,13 @@ add_custom_command(TARGET ch32v208_nimble POST_BUILD
 add_executable(boot
     port/syscalls.c
     app/main.c
+    port/wch_power.c
     app/ch32v20x_it.c
     app/system_ch32v20x.c
     ${SDK_DIR}/Startup/startup_ch32v20x_D8W.S
 )
 set_target_properties(boot PROPERTIES SUFFIX ".elf")
+target_compile_definitions(boot PRIVATE WCH_POWER_DEBUG=1)
 target_link_libraries(boot PRIVATE sdk_periph freertos_kernel logger)
 target_include_directories(boot PRIVATE app port)
 target_link_options(boot PRIVATE
@@ -238,3 +233,6 @@ target_link_options(boot PRIVATE
 # Relink both images when the CRT memory layout changes.
 set_property(TARGET ch32v208_nimble boot APPEND PROPERTY LINK_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/ld/Link.ld)
+
+# Standalone low-power / wakeup demo (excluded from the default build).
+include(cmake/low-power-demo.cmake)

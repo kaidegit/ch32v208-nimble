@@ -88,7 +88,13 @@
 #define MYNEWT_VAL_BLE_LL_CFG_FEAT_LE_CODED_PHY (1)    /* controller advertises and negotiates LE Coded S=2/S=8 */
 #define MYNEWT_VAL_BLE_LL_DTM (1)                      /* controller/syscfg.yml:408 default 0 -> overridden on (RF bring-up) */
 #define MYNEWT_VAL_BLE_LL_WHITELIST_SIZE (8)           /* controller/syscfg.yml:102 default '8'; explicit */
+/* Conservative first STOP integration budget, including RTC/TIM3 handoff.
+ * Tighten only after measuring the combined timebase across many sleeps. */
+#if CH32_LOW_POWER
+#define MYNEWT_VAL_BLE_LL_SCA (500)
+#else
 #define MYNEWT_VAL_BLE_LL_SCA (50)                     /* HSE-derived cputime; match EVT's external-crystal 50 ppm budget, not a measured 20 ppm claim. */
+#endif
 
 /* Flow control / monitor / HCI logging: 沿用默认并显式化 (syscfg.h:1091). */
 #define MYNEWT_VAL_BLE_HS_FLOW_CTRL (0)

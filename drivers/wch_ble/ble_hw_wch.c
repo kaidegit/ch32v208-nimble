@@ -435,11 +435,8 @@ ble_hw_get_static_addr(ble_addr_t *addr)
 /* Platform bring-up entry (called by port/nimble_port_wch.c)                */
 /* ------------------------------------------------------------------------- */
 
-/* Bring-up forensics: step-localizing tripwire checker (app/main.c). */
+/* Validate static memory guards between hardware initialization steps. */
 extern void app_dbg_chk(const char *tag);
-/* In-RAM flight recorder (app/main.c). */
-extern void app_trace(uint32_t tag, void *ra);
-#define HW_TRACE(n)  app_trace((n), __builtin_return_address(0))
 
 void
 wch_ble_hw_init(void)
@@ -447,51 +444,30 @@ wch_ble_hw_init(void)
     int adc_ok = 0;
     uint16_t temp;
 
-    HW_TRACE(0);
-
-    /* ADC FIRST, deliberately before the BLE IP is even clocked: if the
-     * canaries go bad right after this step the ADC path is implicated
-     * with the radio excluded; if they survive until after wch_rf_init()
-     * the radio/calibration window is the suspect instead. */
-    HW_TRACE(1);
+    /* Temperature sampling precedes RF calibration and also seeds the RNG. */
     console_printf("hw: adc\n");
-    HW_TRACE(2);
     temp = adc_temp_sample(&adc_ok);
-    HW_TRACE(3);
     console_printf("hw: adc=%u ok=%d\r\n", temp, adc_ok);
-    HW_TRACE(4);
     app_dbg_chk("hw:adc");
-    HW_TRACE(5);
 
 #if WCH_HW_SKIP_RADIO   /* bring-up A/B test: BLE IP clocked off */
     console_printf("hw: rf_init SKIPPED (A/B test)\n");
 #else
-    HW_TRACE(6);
     console_printf("hw: rf_init\n");
-    HW_TRACE(7);
     int rf_rc = wch_rf_init();
     console_printf("hw: rf_init rc=%d\n", rf_rc);
     configASSERT(rf_rc == 0);
-    HW_TRACE(8);
     app_dbg_chk("hw:rf");
-    HW_TRACE(9);
 
     console_printf("hw: phy_init\n");
     (void)ble_phy_init();
-    HW_TRACE(10);
     app_dbg_chk("hw:phy");
-    HW_TRACE(11);
 #endif
 
     console_printf("hw: rng_seed\n");
-    /* Seed the (weak) software RNG once at boot - the ADC sample is
-     * taken above so the checker brackets it separately. */
-    HW_TRACE(12);
-    HW_TRACE(13);
+    /* Seed the weak software RNG once from the temperature sample. */
     ble_hw_rng_seed_with(temp);
-    HW_TRACE(14);
     app_dbg_chk("hw:seed");
-    HW_TRACE(15);
 
     console_printf("hw: done\n");
 }

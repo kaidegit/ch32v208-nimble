@@ -463,6 +463,11 @@ int  wch_rf_arm_auto_ack(const uint8_t *rsp, uint16_t n);
 
 /* Shutdown sequence, RE §4.3 ble_ll_hw_api_shut */
 void wch_rf_shut(void);
+/* Tickless idle only, PHY idle and global IRQ mask held throughout.
+ * WCH tmos_proces_idle gates RFEND[8] &= 0xffccffff (also RX ADC).
+ * Preserve the previous enable bits for exact restoration before IRQs. */
+uint32_t wch_rf_sleep_prepare(void);
+void wch_rf_sleep_restore(uint32_t enables);
 
 /* RSSI of the last frame, RE §4.9: (int8_t)(BB[0x30] >> 15) */
 int8_t wch_rf_rssi(void);

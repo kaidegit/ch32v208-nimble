@@ -255,14 +255,6 @@ void vPortSwitchContext(void)
 void SysTick_Handler(void) __attribute__((interrupt()));
 void SysTick_Handler( void )
 {
-    /* RAM-only sampler: no logging or assumptions about static TCBs.
-     * NimBLE creates dynamic controller and host tasks after bring-up. */
-    extern volatile uint32_t g_tick_sample_pc;
-    static uint32_t sample_count;
-    if ((++sample_count & 63U) == 0U) {
-        __asm volatile("csrr %0, mepc" : "=r"(g_tick_sample_pc));
-    }
-
     UBaseType_t saved_mask = portSET_INTERRUPT_MASK_FROM_ISR();
     GET_INT_SP();
     SysTick->SR=0;

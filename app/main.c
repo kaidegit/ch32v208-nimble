@@ -8,7 +8,7 @@
  *  - refresh SystemCoreClock, init the UART log backend and print the boot banner
  *  - start the FreeRTOS scheduler with a single "app" task
  *  - app_ble_start() is a weak no-op here; the strong version in
- *    app/app_ble.c (other agent) brings up NimBLE when the full image
+ *    app/app_ble.c brings up NimBLE when the full image
  *    is built.  The 'boot' image links without it on purpose.
  *
  * PFIC enabling of BB/LLE/TIM3 is deliberately NOT done here - that
@@ -24,6 +24,7 @@
 #define LOG_TAG  "boot"
 #include "elog.h"
 #include "wch_log.h"
+#include "wch_power.h"
 #include "ch32v20x.h"
 
 /* Linker-provided boundaries (ld/Link.ld). */
@@ -34,12 +35,8 @@ extern char _eusrstack[];
 
 void app_ble_start( void ) __attribute__( ( weak ) );
 
-/* Forensic zone for the app task: one array holding 8 tripwire words, the
- * 1024-word task stack, and 8 more tripwires - adjacency guaranteed by the
- * single object.  The bring-up saw the A5 fill pattern fully destroyed
- * (hw=0) far below any legitimate depth (-fstack-usage max frame 320 B),
- * i.e. RAM is being written by something; vApplicationStackOverflowHook
- * dumps these words to fingerprint the writer. */
+/* Guard words surround the static app stack so failure hooks can report
+ * writes beyond either end without relying on dynamic allocation. */
 #define APP_STACK_WORDS     ( 1024 )
 #define APP_TRIPWIRE_WORD   ( 0xC0DEC0DEUL )
 static uint32_t g_app_zone[ 8 + APP_STACK_WORDS + 8 ];
@@ -51,25 +48,6 @@ static StaticTask_t xIdleTaskTCB;
 static StackType_t xIdleTaskStack[ configMINIMAL_STACK_SIZE ];
 static StaticTask_t xTimerTaskTCB;
 static StackType_t xTimerTaskStack[ configTIMER_TASK_STACK_DEPTH ];
-
-/* Bring-up forensics: in-RAM flight recorder.  trace(tag, ra) writes
- * (tag, ra, tick) into a fixed ring - no printing, no RTT, ~3 stores.
- * After a silent death, read g_trace_ring via gdb: the last entry's ra
- * pins the exact call site the bomb hit from. */
-volatile uint32_t g_trace_ring[ 3 * 128 ];
-volatile uint32_t g_trace_wr;
-volatile uint32_t g_tick_sample_pc;
-
-void app_trace( uint32_t tag, void * ra )
-{
-    uint32_t w = g_trace_wr++ & 127U;
-
-    g_trace_ring[ w * 3U ] = tag;
-    g_trace_ring[ w * 3U + 1U ] = ( uint32_t ) ( uintptr_t ) ra;
-    g_trace_ring[ w * 3U + 2U ] = g_trace_wr;  /* seq no. - tick read needs kernel.h */
-}
-
-#define TRACE( n )  app_trace( ( n ), __builtin_return_address( 0 ) )
 
 void vApplicationGetIdleTaskMemory( StaticTask_t ** ppxIdleTaskTCBBuffer,
                                     StackType_t ** ppxIdleTaskStackBuffer,
@@ -150,18 +128,8 @@ void vApplicationStackOverflowHook( TaskHandle_t xTask, char * pcTaskName )
     }
 }
 
-/*********************************************************************
- * Bring-up forensics: async-writer tripwire checker.
- *
- * Every bring-up step calls app_dbg_chk(tag).  It fingerprints five
- * canaries at once: pxCurrentTCB (kernel slot @0x2000036C, the word the
- * tick handler dereferences), the unused WCH whitelist (64 B of .bss
- * that nothing writes before a whitelist op), the log ring tripwires
- * (g_wch_log_canary_lo/hi bracket the DMA ring in port/console_uart.c -
- * the replacement for the old RTT control-block ID check), and the
- * g_app_zone tripwires.  On any anomaly it dumps the kernel-variable
- * neighborhood around pxCurrentTCB so the spray shape is visible.
- */
+/* Validate the app task pointer and static memory guards during BLE init.
+ * Log details only on corruption; the normal path produces no output. */
 extern void * volatile pxCurrentTCB;       /* FreeRTOS tasks.c            */
 extern uint32_t g_wch_whitelist[];         /* ble_hw_wch.c canary, 64 B   */
 /* g_wch_log_canary_lo/hi come from wch_log.h (console_uart.c). */
@@ -242,15 +210,31 @@ void app_dbg_chk( const char * tag )
 
 static void app_task( void * pvParameters )
 {
+#if !CH32_LOW_POWER || CH32_POWER_DIAGNOSTICS
     struct wch_log_stats stats;
+#endif
     ( void ) pvParameters;
 
+    wch_power_init();
     app_ble_start(); /* no-op while linked against the weak default */
 
+    wch_power_start();
+#if CH32_LOW_POWER && !CH32_POWER_DIAGNOSTICS
+    log_i("power measurement: periodic app diagnostics disabled");
+    vTaskSuspend(NULL);
+    for (;;) {} /* this task is not resumed by the application */
+#else
+    TickType_t heartbeat = xTaskGetTickCount();
     for( ;; )
     {
-        vTaskDelay( pdMS_TO_TICKS( 1000 ) );
+        vTaskDelayUntil(&heartbeat, pdMS_TO_TICKS(1000));
         wch_log_get_stats( &stats );
+        log_i("pm: RTC=%u mHz stop=%u us=%u abort=%u overrun=%u cal=%u/%u restore_max=%uus short=%u",
+              (unsigned)g_wch_power.rtc_millihz, (unsigned)g_wch_power.sleeps,
+              (unsigned)g_wch_power.slept_us, (unsigned)g_wch_power.aborts,
+              (unsigned)g_wch_power.overruns, (unsigned)g_wch_power.calibrations,
+              (unsigned)g_wch_power.calibration_errors,
+              (unsigned)g_wch_power.recovery_max_us, (unsigned)g_wch_power.short_sleeps);
         log_i( "alive, uptime=%u ticks, sysclk=%u, stk_hw=%uw, "
                "log drop=%u/%uB dma_err=%u dead=%u panic=%u",
                ( unsigned ) xTaskGetTickCount(),
@@ -260,6 +244,7 @@ static void app_task( void * pvParameters )
                ( unsigned ) stats.dma_errors, ( unsigned ) stats.dma_dead,
                ( unsigned ) stats.panic_mode );
     }
+#endif
 }
 
 /* Back to the boot tag for main()'s banner (macros use the definition
